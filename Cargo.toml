@@ -1,0 +1,15 @@
+[package]
+name = "proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+base64 = "0.23.1"
+memchr = "2.8.3"
+quick_cache = "0.7.0"
+reqwest = { version = "0.13.5", features = ["socks", "stream"] }
+smallvec = "1.16.2"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
