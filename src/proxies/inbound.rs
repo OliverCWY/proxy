@@ -1,30 +1,34 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{io::ErrorKind::InvalidInput, net::IpAddr};
 
 use memchr::memchr;
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::TcpStream};
+use smallvec::SmallVec;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    net::TcpStream,
+};
 
-use super::{TcpTarget, utils::invalid_data};
-use super::TargetMachine::*;
-use super::TargetMachineContainer;
-use super::MAX_EXPECTED_TARGET_MACHINE_LENGTH;
+use super::Host::*;
+use super::HostContainer;
+use super::MAX_EXPECTED_DOMAIN_SIZE;
+use super::{Endpoint, utils::invalid_data};
 
 type BodyStream = BufReader<TcpStream>;
 
 #[derive(Default)]
 pub struct Auth {
     pub user: String,
-    pub pass: String
+    pub pass: String,
 }
 
 pub enum Inbound {
-    Forward(TcpTarget, Option<Auth>, BodyStream),
-    Reverse(TcpStream)
+    Forward(Endpoint, Option<Auth>, BodyStream),
+    Reverse(TcpStream),
 }
 
-const MAX_ALLOWED_HEADER_LINE: u64 = 1<<16;
-const MAX_ALLOWED_HEADER_SIZE: usize = 1<<20;
+const _MAX_ALLOWED_HEADER_LINE: u64 = 1 << 16;
+const MAX_ALLOWED_HEADER_SIZE: usize = 1 << 20;
 
-type HandlerResult = anyhow::Result<(TcpTarget, Option<Auth>)>;
+type HandlerResult = anyhow::Result<(Endpoint, Option<Auth>)>;
 
 /// Returns: client can provide auth
 async fn handle_socks5_handshake(reader: &mut BufReader<TcpStream>) -> anyhow::Result<bool> {
@@ -37,16 +41,30 @@ async fn handle_socks5_handshake(reader: &mut BufReader<TcpStream>) -> anyhow::R
     if reader.read_exact(&mut buf[..nmtd]).await? != nmtd {
         return Err(invalid_data("NMETHODS does not match!"));
     };
-    
+
     // TODO: SIMD?
     Ok(buf.into_iter().any(|b| b == 2))
 }
 
 async fn handle_socks5_auth(reader: &mut BufReader<TcpStream>) -> anyhow::Result<Auth> {
-    todo!()
+    if reader.read_u8().await? == 0x01 {
+        return Err(invalid_data("Incorrect signature"));
+    }
+    let ulen = reader.read_u8().await? as usize;
+    let mut user = SmallVec::<[u8; 255]>::new();
+    reader.read_exact(&mut user[..ulen]).await?;
+    let plen = reader.read_u8().await? as usize;
+    let mut pass = SmallVec::<[u8; 255]>::new();
+    reader.read_exact(&mut pass[..plen]).await?;
+    let user = String::from_utf8_lossy(&user).to_string();
+    let pass = String::from_utf8_lossy(&pass).to_string();
+
+    reader.write_all(&[0x01, 0x00]).await?;
+
+    Ok(Auth { user, pass })
 }
 
-async fn handle_socks5_request(reader: &mut BufReader<TcpStream>) -> anyhow::Result<TcpTarget> {
+async fn handle_socks5_request(reader: &mut BufReader<TcpStream>) -> anyhow::Result<Endpoint> {
     let ver = reader.read_u8().await?;
     let cmd = reader.read_u8().await?;
     let _rsv = reader.read_u8().await?;
@@ -56,26 +74,34 @@ async fn handle_socks5_request(reader: &mut BufReader<TcpStream>) -> anyhow::Res
     if ver != 0x05 || cmd != 0x01 {
         return Err(invalid_data("Incorrect signature"));
     }
+
+    let mut reader = BufWriter::new(reader);
+    reader.write_all(&[0x05, 0x00, 0x00, atyp]).await?;
+
     let host = match atyp {
         0x01 => {
             let mut bytes = [0u8; 4];
             reader.read_exact(&mut bytes).await?;
+            reader.write_all(&bytes).await?;
             let ip = IpAddr::from(bytes);
             Ip(ip)
         }
         0x03 => {
             let len = reader.read_u8().await? as usize;
             dbg!(len);
-            if len >= MAX_EXPECTED_TARGET_MACHINE_LENGTH {
+            if len >= MAX_EXPECTED_DOMAIN_SIZE {
                 return Err(invalid_data("Domain too long!"));
             }
-            let mut buffer = [0u8; MAX_EXPECTED_TARGET_MACHINE_LENGTH];
+            let mut buffer = [0u8; MAX_EXPECTED_DOMAIN_SIZE];
             reader.read_exact(&mut buffer[..len]).await?;
-            Domain(TargetMachineContainer::from(&buffer[..len]))
+            reader.write_u8(len as u8).await?;
+            reader.write_all(&buffer[..len]).await?;
+            Domain(HostContainer::from(&buffer[..len]))
         }
         0x04 => {
             let mut bytes = [0u8; 16];
             reader.read_exact(&mut bytes).await?;
+            reader.write_all(&bytes).await?;
             let ip = IpAddr::from(bytes);
             Ip(ip)
         }
@@ -88,7 +114,10 @@ async fn handle_socks5_request(reader: &mut BufReader<TcpStream>) -> anyhow::Res
 
     dbg!(port);
 
-    Ok(TcpTarget { host, port })
+    reader.write_u16(port).await?;
+    reader.flush().await?;
+
+    Ok(Endpoint { host, port })
 }
 
 async fn parse_socks5(reader: &mut BufReader<TcpStream>, requires_auth: bool) -> HandlerResult {
@@ -96,22 +125,26 @@ async fn parse_socks5(reader: &mut BufReader<TcpStream>, requires_auth: bool) ->
 
     // TODO: probably check auth while making handshake, rather than delay until actual request?
     let auth = if requires_auth {
-        reader.write_all(&mut [0x05, 0x02]).await?;
+        reader.write_all(&[0x05, 0x02]).await?;
         if !supports_auth {
             return Err(invalid_data("Requires Auth!"));
         }
         let auth = Some(handle_socks5_auth(reader).await?);
-        reader.write_all(&mut [0x01, 0x00]).await?;
+        reader.write_all(&[0x01, 0x00]).await?;
         auth
     } else {
-        reader.write_all(&mut [0x05, 0x00]).await?;
+        reader.write_all(&[0x05, 0x00]).await?;
         None
     };
     let target = handle_socks5_request(reader).await?;
     Ok((target, auth))
 }
 
-async fn read_line(reader: &mut BufReader<TcpStream>, buffer: &mut Vec<u8>, header_size: &mut usize) -> anyhow::Result<()> {
+async fn read_line(
+    reader: &mut BufReader<TcpStream>,
+    buffer: &mut Vec<u8>,
+    header_size: &mut usize,
+) -> anyhow::Result<()> {
     // TODO: create zero_copied (when whole line fits into buffer) Cow buffer, but strictly within upper bound
     reader.read_until(b'\n', buffer).await?;
     if buffer.is_empty() {
@@ -129,14 +162,15 @@ async fn read_line(reader: &mut BufReader<TcpStream>, buffer: &mut Vec<u8>, head
     Ok(())
 }
 
-async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(TcpTarget, Option<Auth>)> {
+async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(Endpoint, Option<Auth>)> {
     let mut header_size = 0usize;
     let mut line = Vec::new();
 
     fn incorrect_header(line: &[u8]) -> anyhow::Error {
-        invalid_data(
-            format!("Incorrect format for header line: {}", String::from_utf8_lossy(line))
-        ).into()
+        invalid_data(format!(
+            "Incorrect format for header line: {}",
+            String::from_utf8_lossy(line)
+        ))
     }
 
     read_line(reader, &mut line, &mut header_size).await?;
@@ -144,18 +178,17 @@ async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(TcpTar
 
     // TODO: support ipv6
     let colon_pos = memchr::memchr(b':', &line).ok_or_else(err_fn)?;
-    let host_start = memchr::memrchr(b' ', &line[..colon_pos]).ok_or_else(err_fn)?;
+    let host_start = memchr::memrchr(b' ', &line[..colon_pos]).ok_or_else(err_fn)? + 1;
     let port_end = memchr::memchr(b' ', &line[colon_pos..]).ok_or_else(err_fn)? + colon_pos;
     let host = String::from_utf8(Vec::from(&line[host_start..colon_pos]))?;
-    let port = String::from_utf8_lossy(&line[colon_pos+1..port_end]).parse::<u16>()?;
+    let port = String::from_utf8_lossy(&line[colon_pos + 1..port_end]).parse::<u16>()?;
 
-    let host = host.parse::<IpAddr>().map(Ip).unwrap_or_else(|_| 
-        Domain(TargetMachineContainer::from(&line[host_start..colon_pos]))
-    );
+    let host = host
+        .parse::<IpAddr>()
+        .map(Ip)
+        .unwrap_or_else(|_| Domain(HostContainer::from(&line[host_start..colon_pos])));
 
-    let target = TcpTarget {
-        host, port
-    };
+    let target = Endpoint { host, port };
 
     let mut auth = None;
 
@@ -163,17 +196,24 @@ async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(TcpTar
     loop {
         read_line(reader, &mut line, &mut header_size).await?;
         if line.is_empty() {
+            reader
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+
             return Ok((target, auth));
         }
         let err_fn = || incorrect_header(&line);
         let pos = memchr(b':', &line).ok_or_else(err_fn)?;
-        let value_start = if pos+1 < line.len() && line[pos+1] == b' ' {
+        let value_start = if pos + 1 < line.len() && line[pos + 1] == b' ' {
             pos + 2
         } else {
             pos + 1
         };
         let (name, value) = (&line[..pos], &line[value_start..]);
-        dbg!(String::from_utf8_lossy(name), String::from_utf8_lossy(value));
+        dbg!(
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(value)
+        );
 
         // TODO: should collect other headers?
         if name == b"Proxy-Authorization" {
@@ -184,34 +224,36 @@ async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(TcpTar
             let auth_bytes = BASE64_STANDARD.decode(&value[6..])?;
             let colon_pos = memchr::memchr(b':', &auth_bytes).ok_or_else(err_fn)?;
             let user = String::from_utf8(Vec::from(&auth_bytes[..colon_pos]))?;
-            let pass = String::from_utf8(Vec::from(&auth_bytes[colon_pos+1..]))?;
-            auth = Some(Auth {user, pass});
+            let pass = String::from_utf8(Vec::from(&auth_bytes[colon_pos + 1..]))?;
+            auth = Some(Auth { user, pass });
         };
         line.clear()
     }
 }
 
 // TODO: should accept config to determine whether socks5 should request for auth
-pub async fn parse_inbound_request(mut client: TcpStream) -> Result<Inbound, (anyhow::Error, TcpStream)> {
+pub async fn parse_inbound_request(
+    client: TcpStream,
+) -> Result<Inbound, (anyhow::Error, TcpStream)> {
     let mut buf = [0u8; 8];
     if let Err(e) = client.peek(&mut buf).await {
-        return Err((e.into(), client))
+        return Err((e.into(), client));
     }
     match buf[0] {
         0x05 => {
             let mut reader = BufReader::new(client);
             match parse_socks5(&mut reader, false).await {
                 Err(e) => Err((e, reader.into_inner())),
-                Ok((target, auth)) => Ok(Inbound::Forward(target, auth, reader))
+                Ok((target, auth)) => Ok(Inbound::Forward(target, auth, reader)),
             }
-        },
+        }
         b'C' if buf.starts_with(b"CONNECT ") => {
             let mut reader = BufReader::new(client);
             match parse_http(&mut reader).await {
                 Err(e) => Err((e, reader.into_inner())),
-                Ok((target, auth)) => Ok(Inbound::Forward(target, auth, reader))
+                Ok((target, auth)) => Ok(Inbound::Forward(target, auth, reader)),
             }
-        },
-        _ => Ok(Inbound::Reverse(client))
+        }
+        _ => Ok(Inbound::Reverse(client)),
     }
 }

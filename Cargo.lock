@@ -796,6 +796,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bytes",
+ "itoa",
  "memchr",
  "quick_cache",
  "reqwest",

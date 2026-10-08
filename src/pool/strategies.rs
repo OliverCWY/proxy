@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 pub trait Strategy: Send + Sync {
     fn choose<'a>(&self, from: &'a [Arc<str>]) -> Option<&'a Arc<str>>;
@@ -6,7 +9,7 @@ pub trait Strategy: Send + Sync {
 
 #[derive(Default)]
 pub struct RoundRobin {
-    i: AtomicUsize
+    i: AtomicUsize,
 }
 
 impl Strategy for RoundRobin {
