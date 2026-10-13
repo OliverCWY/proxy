@@ -1,7 +1,10 @@
 use std::{io::ErrorKind::InvalidInput, net::IpAddr};
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use memchr::memchr;
 use smallvec::SmallVec;
+use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::TcpStream,
@@ -15,54 +18,83 @@ use super::{Endpoint, utils::invalid_data};
 type BodyStream = BufReader<TcpStream>;
 
 #[derive(Default)]
-pub struct Auth {
+pub struct InboundAuth {
     pub user: String,
     pub pass: String,
 }
 
 pub enum Inbound {
-    Forward(Endpoint, Option<Auth>, BodyStream),
+    Forward(Endpoint, Option<InboundAuth>, BodyStream),
     Reverse(TcpStream),
 }
 
 const _MAX_ALLOWED_HEADER_LINE: u64 = 1 << 16;
 const MAX_ALLOWED_HEADER_SIZE: usize = 1 << 20;
 
-type HandlerResult = anyhow::Result<(Endpoint, Option<Auth>)>;
+type Result<T> = std::result::Result<T, InboundError>;
+
+#[async_trait]
+pub trait ForwardRequest: Send {
+    async fn handshake_no_auth(&mut self) -> Result<()>;
+    async fn handshake_must_auth(&mut self) -> Result<InboundAuth>;
+    async fn auth_failed(self) -> Result<()>;
+
+    async fn get_target(&mut self) -> Result<Endpoint>;
+    async fn succeed(self) -> Result<(Bytes, TcpStream)>;
+    async fn upstream_failed(self) -> Result<()>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardStage {
+    Init,
+    NoAuthInitCompleted,
+    AuthYielded,
+    TargetYielded,
+    Invalid,
+}
+
+struct ForwardChecker<T: ForwardRequest> {
+    inner: T,
+    stage: ForwardStage,
+}
+
+impl<T: ForwardRequest> ForwardChecker<T> {
+    fn invalidate(&mut self) {
+        self.stage = ForwardStage::Invalid;
+    }
+}
+
+impl<T: ForwardRequest> From<T> for ForwardChecker<T> {
+    fn from(value: T) -> Self {
+        Self {
+            inner: value,
+            stage: ForwardStage::Init,
+        }
+    }
+}
+
+#[async_trait]
+impl<T: ForwardRequest> ForwardRequest for ForwardChecker<T> {
+    async fn handshake_no_auth(&mut self) -> Result<()> {
+        assert_eq!(self.stage, ForwardStage::Init);
+        self.inner
+            .handshake_no_auth()
+            .await
+            .inspect_err(|_| self.invalidate())
+    }
+    async fn handshake_must_auth(&mut self) -> Result<InboundAuth> {
+        assert_eq!(self.stage, ForwardStage::Init);
+        self.inner
+            .handshake_must_auth()
+            .await
+            .inspect_err(|_| self.invalidate())
+    }
+}
 
 /// Returns: client can provide auth
-async fn handle_socks5_handshake(reader: &mut BufReader<TcpStream>) -> anyhow::Result<bool> {
-    let ver = reader.read_u8().await?;
-    if ver != 0x05 {
-        return Err(invalid_data("Incorrect signature"));
-    }
-    let nmtd = reader.read_u8().await? as usize;
-    let mut buf = [0u8; 255];
-    if reader.read_exact(&mut buf[..nmtd]).await? != nmtd {
-        return Err(invalid_data("NMETHODS does not match!"));
-    };
+async fn handle_socks5_handshake(reader: &mut BufReader<TcpStream>) -> anyhow::Result<bool> {}
 
-    // TODO: SIMD?
-    Ok(buf.into_iter().any(|b| b == 2))
-}
-
-async fn handle_socks5_auth(reader: &mut BufReader<TcpStream>) -> anyhow::Result<Auth> {
-    if reader.read_u8().await? == 0x01 {
-        return Err(invalid_data("Incorrect signature"));
-    }
-    let ulen = reader.read_u8().await? as usize;
-    let mut user = SmallVec::<[u8; 255]>::new();
-    reader.read_exact(&mut user[..ulen]).await?;
-    let plen = reader.read_u8().await? as usize;
-    let mut pass = SmallVec::<[u8; 255]>::new();
-    reader.read_exact(&mut pass[..plen]).await?;
-    let user = String::from_utf8_lossy(&user).to_string();
-    let pass = String::from_utf8_lossy(&pass).to_string();
-
-    reader.write_all(&[0x01, 0x00]).await?;
-
-    Ok(Auth { user, pass })
-}
+async fn handle_socks5_auth(reader: &mut BufReader<TcpStream>) -> anyhow::Result<InboundAuth> {}
 
 async fn handle_socks5_request(reader: &mut BufReader<TcpStream>) -> anyhow::Result<Endpoint> {
     let ver = reader.read_u8().await?;
@@ -133,7 +165,6 @@ async fn parse_socks5(reader: &mut BufReader<TcpStream>, requires_auth: bool) ->
         reader.write_all(&[0x01, 0x00]).await?;
         auth
     } else {
-        reader.write_all(&[0x05, 0x00]).await?;
         None
     };
     let target = handle_socks5_request(reader).await?;
@@ -162,7 +193,9 @@ async fn read_line(
     Ok(())
 }
 
-async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(Endpoint, Option<Auth>)> {
+async fn parse_http(
+    reader: &mut BufReader<TcpStream>,
+) -> anyhow::Result<(Endpoint, Option<InboundAuth>)> {
     let mut header_size = 0usize;
     let mut line = Vec::new();
 
@@ -225,7 +258,7 @@ async fn parse_http(reader: &mut BufReader<TcpStream>) -> anyhow::Result<(Endpoi
             let colon_pos = memchr::memchr(b':', &auth_bytes).ok_or_else(err_fn)?;
             let user = String::from_utf8(Vec::from(&auth_bytes[..colon_pos]))?;
             let pass = String::from_utf8(Vec::from(&auth_bytes[colon_pos + 1..]))?;
-            auth = Some(Auth { user, pass });
+            auth = Some(InboundAuth { user, pass });
         };
         line.clear()
     }

@@ -1,14 +1,16 @@
+use std::sync::Arc;
+
+use arrayvec::ArrayVec;
 use async_trait::async_trait;
-use smallvec::{SmallVec, smallvec};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
-use crate::proxies::{
-    Endpoint, MAX_EXPECTED_AUTH_HEADER_LENGTH, MAX_EXPECTED_DOMAIN_SIZE,
-    MAX_EXPECTED_HTTP_CONNECT_HEADER_SIZE, utils::invalid_data,
-};
+use crate::proxies::{Endpoint, MAX_EXPECTED_DOMAIN_SIZE, utils::invalid_data};
+
+pub type OutboundError = anyhow::Error;
+pub type OutboundResult<T> = Result<T, OutboundError>;
 
 pub trait IoStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
@@ -31,8 +33,10 @@ impl<T: OutboundProxy> OutboundProxyDyn for T {
     }
 }
 
-pub type Auth = SmallVec<[u8; MAX_EXPECTED_AUTH_HEADER_LENGTH]>;
+pub type Auth = Arc<[u8]>;
 
+// Clone for every thread to have an Arc of auth and endpoint
+#[derive(Clone, Debug)]
 pub enum SimpleProxy {
     NoProxy,
     Http {
@@ -40,14 +44,14 @@ pub enum SimpleProxy {
         /// b"Proxy-Authorization: {base64_encoded}\r\n";
         /// Or completely empty for no-auth
         auth_header: Auth,
-        host: Endpoint,
+        endpoint: Endpoint,
     },
     Socks5 {
         /// In the format
         /// [0x01, ULEN] :: UNAME :: [PLEN] :: PASSWD
         /// Or completely empty for no-auth
         auth: Auth,
-        host: Endpoint,
+        endpoint: Endpoint,
         dns: bool,
     },
 }
@@ -57,7 +61,7 @@ impl SimpleProxy {
         proxy: &Endpoint,
         auth_header: &Auth,
         target: &Endpoint,
-    ) -> anyhow::Result<TcpStream> {
+    ) -> OutboundResult<TcpStream> {
         let mut stream = TcpStream::connect(proxy.get_socket_addr().await?.as_slice()).await?;
 
         let connect = b"CONNECT ";
@@ -78,8 +82,10 @@ impl SimpleProxy {
             end,
         ];
 
-        let mut bytes = SmallVec::<[u8; MAX_EXPECTED_HTTP_CONNECT_HEADER_SIZE]>::new();
-        strs.into_iter().for_each(|s| bytes.extend_from_slice(s));
+        let mut bytes = ArrayVec::<u8, 270>::new();
+        for s in strs {
+            bytes.try_extend_from_slice(s)?;
+        }
         stream.write_all(&bytes).await?;
 
         dbg!(String::from_utf8_lossy(&bytes));
@@ -107,7 +113,7 @@ impl SimpleProxy {
         Ok(stream)
     }
 
-    async fn handle_socks5_auth(auth: &Auth, stream: &mut TcpStream) -> anyhow::Result<()> {
+    async fn handle_socks5_auth(auth: &Auth, stream: &mut TcpStream) -> OutboundResult<()> {
         stream.write_all(auth).await?;
         let mut auth_res = [0u8; 2];
         stream.read_exact(&mut auth_res).await?;
@@ -122,7 +128,7 @@ impl SimpleProxy {
         proxy: &Endpoint,
         auth: &Auth,
         target: &Endpoint,
-    ) -> anyhow::Result<TcpStream> {
+    ) -> OutboundResult<TcpStream> {
         let mut stream = TcpStream::connect(proxy.get_socket_addr().await?.as_slice()).await?;
 
         // Round 1: negotiation
@@ -153,7 +159,7 @@ impl SimpleProxy {
             }
         }
 
-        let mut connect_buffer: SmallVec<[u8; 128]> = smallvec![0x05, 0x01, 0x00];
+        let mut connect_buffer = ArrayVec::<u8, 270>::new();
         target.fill_socks5_connect_buffer(&mut connect_buffer);
         stream.write_all(&connect_buffer).await?;
 
@@ -195,18 +201,19 @@ impl SimpleProxy {
 
 #[async_trait]
 impl OutboundProxy for SimpleProxy {
-    async fn connect(&self, target: &Endpoint) -> anyhow::Result<impl IoStream> {
+    async fn connect(&self, target: &Endpoint) -> OutboundResult<impl IoStream> {
         use SimpleProxy::*;
         match self {
             NoProxy => Ok(TcpStream::connect(target.get_socket_addr().await?.as_slice()).await?),
-            Http { auth_header, host } => {
-                Self::connect_http_outbound(host, auth_header, target).await
-            }
+            Http {
+                auth_header,
+                endpoint,
+            } => Self::connect_http_outbound(endpoint, auth_header, target).await,
             Socks5 {
                 auth,
-                host,
+                endpoint,
                 dns: _dns,
-            } => Self::connect_socks5_outbound(host, auth, target).await,
+            } => Self::connect_socks5_outbound(endpoint, auth, target).await,
         }
     }
 }
