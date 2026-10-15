@@ -64,8 +64,7 @@ impl HttpInitState {
         read_line(reader, &mut line, &mut header_size).await?;
         let err_fn = || incorrect_format("Incorrect CONNECT format", &line);
 
-        // TODO: support ipv6
-        let colon_pos = memchr::memchr(b':', &line).ok_or_else(err_fn)?;
+        let colon_pos = memchr::memrchr(b':', &line).ok_or_else(err_fn)?;
         let host_start = memchr::memrchr(b' ', &line[..colon_pos]).ok_or_else(err_fn)? + 1;
         let port_end = memchr::memchr(b' ', &line[colon_pos..]).ok_or_else(err_fn)? + colon_pos;
         let host = String::from_utf8(Vec::from(&line[host_start..colon_pos]))?;
@@ -141,6 +140,10 @@ impl HttpPendingAuthState {
             self.target,
         )
     }
+    pub async fn reject(mut self) -> anyhow::Result<()> {
+        self.stream.write_all(b"401 Unauthorized").await?;
+        Ok(())
+    }
 }
 
 pub struct HttpReadyState {
@@ -155,6 +158,7 @@ impl HttpReadyState {
         Ok(self.stream)
     }
     pub async fn fail(mut self, error: OutboundError) -> InboundResult<()> {
-        todo!()
+        self.stream.write_all(b"502 Bad Gateway").await?;
+        Ok(())
     }
 }

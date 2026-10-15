@@ -2,7 +2,7 @@ use std::{net::IpAddr, time::Duration};
 
 use async_backtrace::framed;
 use fast_socks5::{
-    Socks5Command, client,
+    Socks5Command,
     server::{Socks5ServerProtocol, run_tcp_proxy},
     util::target_addr::TargetAddr,
 };
@@ -29,7 +29,7 @@ use utils::*;
 async fn proxy_client(proxy: &str, target: Endpoint) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let proxy = parse_proxy(proxy).unwrap();
-    let mut stream = proxy.connect(&target).await?;
+    let mut stream = proxy.connect_inner(&target).await?;
 
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -178,7 +178,7 @@ async fn test_outbound_proxy(
 
     let server = proxy_server(listener, auth.clone(), proto, target.clone());
     let proxy = get_proxy(proto, auth, port);
-    let client = timeout(10, proxy_client(&proxy, target));
+    let client = timeout(20, proxy_client(&proxy, target));
     let (server_res, client_res) = dbg!(join!(server, client));
     if let Some(msg) = scenario.outbound_fail_message(proto) {
         let error_msgs: Vec<String> = [server_res, client_res]

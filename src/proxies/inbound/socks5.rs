@@ -33,8 +33,8 @@ impl Socks5InitState {
     }
 
     // wait for rfc to be merged
-    fn no_supported_method() -> InboundResult<()> {
-        // should respond with no supported method
+    async fn no_supported_method(&mut self) -> InboundResult<()> {
+        self.stream.write_all(&[0x05, 0xFF]).await?;
         Err(IncorrectFormat("No supported method is provided").into())
     }
 
@@ -48,9 +48,10 @@ impl Socks5InitState {
         }
         let nmtd = reader.read_u8().await? as usize;
         if nmtd == 0 {
-            Self::no_supported_method()?;
+            self.no_supported_method().await?;
         }
 
+        let reader = &mut self.stream;
         let mut buf = [0u8; 255];
         let nmtd_actual = reader.read_exact(&mut buf[..nmtd]).await?;
         if nmtd_actual != nmtd {
@@ -75,7 +76,7 @@ impl Socks5InitState {
     pub(super) async fn handshake_no_auth(mut self) -> InboundResult<Socks5PendingAuthState> {
         let methods = self.handshake().await?;
         if !methods.no_auth {
-            Self::no_supported_method()?;
+            self.no_supported_method().await?;
         }
         self.stream.write_all(&[0x05, 0x00]).await?;
         Ok(Socks5PendingAuthState {
@@ -89,7 +90,7 @@ impl Socks5InitState {
     ) -> InboundResult<(Socks5PendingAuthState, InboundAuth)> {
         let methods = self.handshake().await?;
         if !methods.pass {
-            Self::no_supported_method()?;
+            self.no_supported_method().await?;
         }
         let reader = &mut self.stream;
         reader.write_all(&[0x05, 0x02]).await?;
@@ -185,7 +186,8 @@ impl Socks5PendingAuthState {
         ))
     }
     pub(super) async fn reject(mut self) -> InboundResult<()> {
-        todo!()
+        self.stream.write_all(&[0x01, 0x01]).await?;
+        Ok(())
     }
 }
 
@@ -201,6 +203,10 @@ impl Socks5ReadyState {
         Ok(self.stream)
     }
     pub(super) async fn fail(mut self, error: OutboundError) -> InboundResult<()> {
-        todo!()
+        self.stream
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+        self.stream.flush().await?;
+        Ok(())
     }
 }

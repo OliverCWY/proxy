@@ -13,8 +13,7 @@ pub mod inbound;
 pub mod outbound;
 pub mod utils;
 
-pub const MAX_EXPECTED_AUTH_HEADER_LENGTH: usize = 512;
-pub const MAX_EXPECTED_DOMAIN_SIZE: usize = 64;
+pub const MAX_ALLOWED_DOMAIN_SIZE: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {

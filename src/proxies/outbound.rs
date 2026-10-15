@@ -7,7 +7,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::proxies::{Endpoint, MAX_EXPECTED_DOMAIN_SIZE, utils::invalid_data};
+use crate::proxies::{Endpoint, MAX_ALLOWED_DOMAIN_SIZE, utils::invalid_data};
 
 pub type OutboundError = anyhow::Error;
 pub type OutboundResult<T> = Result<T, OutboundError>;
@@ -194,11 +194,7 @@ impl SimpleProxy {
             }
             0x03 => {
                 let len = stream.read_u8().await? as usize;
-                dbg!(len);
-                if len >= MAX_EXPECTED_DOMAIN_SIZE {
-                    return Err(invalid_data("Domain too long!"));
-                }
-                let mut buffer = [0u8; MAX_EXPECTED_DOMAIN_SIZE];
+                let mut buffer = [0u8; MAX_ALLOWED_DOMAIN_SIZE];
                 stream.read_exact(&mut buffer[..len]).await?;
             }
             0x04 => {
@@ -214,7 +210,7 @@ impl SimpleProxy {
 }
 
 impl SimpleProxy {
-    async fn connect_inner(&self, target: &Endpoint) -> anyhow::Result<TcpStream> {
+    pub async fn connect_inner(&self, target: &Endpoint) -> anyhow::Result<TcpStream> {
         use SimpleProxy::*;
         match self {
             NoProxy => Ok(TcpStream::connect(target.get_socket_addr().await?.as_slice()).await?),

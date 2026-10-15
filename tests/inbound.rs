@@ -25,7 +25,7 @@ async fn proxy_server(listener: TcpListener, auth: Option<InboundAuth>) -> anyho
         let (next, target) = next.get_target().await?;
         dbg!(&target);
         let proxy = SimpleProxy::NoProxy;
-        let mut proxy = proxy.connect(&target).await?;
+        let mut proxy = proxy.connect_inner(&target).await?;
         let mut inbound = next.success().await?;
         copy_bidirectional(&mut inbound, &mut proxy).await?;
         Ok(())
@@ -91,3 +91,5 @@ async fn test_inbound_proxy(
         client_res.expect("Client request failed unexpectedly");
     }
 }
+
+// TODO: add auth failed tests

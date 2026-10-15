@@ -106,7 +106,10 @@ impl InboundInitState {
 
 impl InboundPendingAuthState {
     pub async fn reject(self) -> InboundResult<()> {
-        todo!()
+        match self {
+            Self::Http(http) => http.reject().await,
+            Self::Socks5(socks5) => socks5.reject().await,
+        }
     }
     pub async fn get_target(self) -> InboundResult<(InboundReadyState, Endpoint)> {
         match self {
