@@ -17,7 +17,7 @@
  • 纯内存 LeaseTable/Trie        • 单端口多路复用 (2260)          • 节点连续失败熔断/退避/半开    • 多订阅不可变 Hash 去重
  • Axum 控制面 REST API          • 双 Token 鉴权隔离 (Admin/Proxy)• 目标站 SSRF 与域名黑名单快速阻断• Platform 虚拟可路由视图
  • Vue 3 嵌入式单二进制 Web UI   • Resin 规范反代 URL 路径解析    • 脏节点永久驱逐/拉黑与洗白     • Web UI 接入面板/移动端/i18n
- ( [x] 已完成并提交 )            ( [ ] 正在实施 )                 ( [ ] 下一步实施 )              ( [ ] 规划中 )
+ ( [x] 已完成并提交 )            ( [x] 已完成并提交 )             ( [ ] 下一步实施 )              ( [ ] 规划中 )
 ```
 
 ---
@@ -57,18 +57,18 @@
 
 ## 三、当前与未来演进计划 (Detailed Roadmap)
 
-### 阶段 4：单端口四合一聚合与 Resin 规范反代管道 (当前实施)
-- [ ] **单端口多协议自动分流器 (Single-Port Multiplexer)**：
-  - 全局仅暴露单个主端口（如 `2260` 或用户配置端口）；
+### 阶段 4：单端口四合一聚合与 Resin 规范反代管道 (Commit: `08b84c03`)
+- [x] **单端口多协议自动分流器 (Single-Port Multiplexer)**：
+  - 全局仅暴露单个主端口（默认 2260，兼容 1099 与自定义环境变量）；
   - 1 字节 Peek 区分 `0x05`（SOCKS5）与 HTTP；
   - HTTP 首部状态机分流：
     - `CONNECT` 请求 $\to$ 正向 HTTP 隧道代理；
     - 路径以 `/ui`、`/api`、`/metrics`、`/healthz` 开头 $\to$ 控制面与内嵌 Web UI；
     - 其余路径形态 $\to$ 走 Resin 规范反向代理管道。
-- [ ] **双 Token 鉴权体系隔离**：
+- [x] **双 Token 鉴权体系隔离**：
   - `ADMIN_TOKEN`：保护控制面 API 与 Web UI 登录（Bearer 认证），未配置时自动开启免认证模式；
   - `PROXY_TOKEN`：代理转发鉴权密钥（反代放 URL 第一段，正代放 Basic Auth 密码位）。
-- [ ] **Resin 规范反代 URL 路径解析器 (V1 协议标准)**：
+- [x] **Resin 规范反代 URL 路径解析器 (V1 协议标准)**：
   - 接入规范格式：`/{PROXY_TOKEN}/{Platform.Account}/{protocol}/{target_host}/{target_path...}?{query}`；
   - 第 1 段 Token 快速校验，不匹配直接 `403 AUTH_FAILED`；
   - 第 2 段按 `.` 拆分平台与业务账号（支持 `:` 兼容与三级空账号回落）；

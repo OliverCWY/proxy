@@ -6,6 +6,7 @@ use tokio::{
 
 use crate::{
     error::{InboundError, OutboundError},
+    inbound::prefixed::PrefixedStream,
     protocol::{Credentials, TargetAddr},
 };
 
@@ -17,7 +18,18 @@ pub struct HttpHandshake {
 
 pub enum HttpInboundSession {
     Connect(PendingHttpSession),
+    Admin(PrefixedStream<TcpStream>),
     Reverse(ReverseHttpRequest),
+}
+
+pub fn is_admin_or_webui_path(path: &str) -> bool {
+    path == "/"
+        || path == "/ui"
+        || path.starts_with("/ui/")
+        || path == "/api"
+        || path.starts_with("/api/")
+        || path == "/metrics"
+        || path == "/healthz"
 }
 
 impl HttpHandshake {
@@ -89,6 +101,15 @@ impl HttpHandshake {
                 credentials,
                 residual_data,
             }))
+        } else if is_admin_or_webui_path(path) {
+            let unconsumed = self.stream.buffer();
+            let mut prefix = BytesMut::with_capacity(buf.len() + unconsumed.len());
+            prefix.extend_from_slice(&buf);
+            prefix.extend_from_slice(unconsumed);
+
+            let raw_socket = self.stream.into_inner();
+            let prefixed = PrefixedStream::new(prefix.freeze(), raw_socket);
+            Ok(HttpInboundSession::Admin(prefixed))
         } else {
             // Reverse proxy HTTP request
             Ok(HttpInboundSession::Reverse(ReverseHttpRequest {

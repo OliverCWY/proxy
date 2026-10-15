@@ -43,6 +43,28 @@ pub fn create_api_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Serve a single pre-buffered HTTP connection with the Axum router
+pub async fn serve_single_connection(
+    stream: crate::inbound::prefixed::PrefixedStream<tokio::net::TcpStream>,
+    router: Router,
+) {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::Service;
+
+    let io = TokioIo::new(stream);
+    let mut make_service = router.into_make_service();
+    let service = match make_service.call(()).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let hyper_service = hyper_util::service::TowerToHyperService::new(service);
+
+    let _ = Builder::new(TokioExecutor::new())
+        .serve_connection(io, hyper_service)
+        .await;
+}
+
 // 1. System Info
 #[derive(Serialize)]
 pub struct SystemInfoResponse {

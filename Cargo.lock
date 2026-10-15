@@ -1156,6 +1156,8 @@ dependencies = [
  "fast-socks5",
  "fastrand",
  "httparse",
+ "hyper",
+ "hyper-util",
  "itoa",
  "memchr",
  "mime_guess",

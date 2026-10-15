@@ -1,4 +1,5 @@
 pub mod rules;
+pub mod v1;
 
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -7,17 +8,30 @@ use crate::{
     error::InboundError,
     inbound::http::ReverseHttpRequest,
     pool::ProxyPool,
-    protocol::{Credentials, TargetAddr},
+    protocol::Credentials,
+    reverse::{rules::AccountMatcherRuntime, v1::parse_resin_path},
 };
 
 pub struct ReverseProxyHandler {
     pool: Arc<ProxyPool>,
+    rules_runtime: Option<Arc<AccountMatcherRuntime>>,
+    proxy_token: Option<String>,
     auth: Option<Credentials>,
 }
 
 impl ReverseProxyHandler {
-    pub fn new(pool: Arc<ProxyPool>, auth: Option<Credentials>) -> Self {
-        Self { pool, auth }
+    pub fn new(
+        pool: Arc<ProxyPool>,
+        rules_runtime: Option<Arc<AccountMatcherRuntime>>,
+        proxy_token: Option<String>,
+        auth: Option<Credentials>,
+    ) -> Self {
+        Self {
+            pool,
+            rules_runtime,
+            proxy_token,
+            auth,
+        }
     }
 
     pub fn auth(&self) -> Option<&Credentials> {
@@ -26,8 +40,8 @@ impl ReverseProxyHandler {
 
     /// Handle standard incoming HTTP request (GET, POST, etc.) for reverse proxying.
     /// Supports:
-    /// 1. Path-based target routing: `/target/{target_authority}/{rest_of_path}`
-    /// 2. Header-based routing: `Host` header resolution.
+    /// 1. Resin V1 Path routing: `/{token}/{platform.account}/{protocol}/{host}/{path}`
+    /// 2. Legacy path routing: `/target/{target_authority}/{rest_of_path}`
     pub async fn handle(
         &self,
         req_session: ReverseHttpRequest,
@@ -45,32 +59,49 @@ impl ReverseProxyHandler {
         let path = req.path.unwrap_or("/");
         let method = req.method.unwrap_or("GET");
 
-        // Parse path routing or host routing
-        let (target, target_path) = parse_reverse_target(path, req.headers)?;
+        // Parse Resin V1 path routing
+        let parsed_target = parse_resin_path(
+            path,
+            self.proxy_token.as_deref(),
+            req.headers,
+            self.rules_runtime.as_ref(),
+        )?;
 
-        // Forward to target through proxy pool
-        let (mut upstream, _upstream_residual, _node) = self
-            .pool
-            .connect_with_retry(&target)
-            .await
-            .map_err(|e| {
+        let target = parsed_target.target;
+        let target_path = parsed_target.target_path;
+
+        // Forward to target through proxy pool (using sticky session if account is present!)
+        let (mut upstream, _upstream_residual, _node) = if let Some(account) = parsed_target.account {
+            self.pool.connect_sticky(&account, &target).await.map_err(|e| {
+                InboundError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("Sticky proxy connect failed: {e}"),
+                ))
+            })?
+        } else {
+            self.pool.connect_with_retry(&target).await.map_err(|e| {
                 InboundError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     format!("Proxy pool connect failed: {e}"),
                 ))
-            })?;
+            })?
+        };
 
         // Reconstruct request line with target_path
         let mut fwd_headers = Vec::with_capacity(512);
         use std::io::Write;
         write!(&mut fwd_headers, "{method} {target_path} HTTP/1.1\r\n").ok();
 
-        // Copy original headers, modifying Host
+        // Copy original headers, modifying Host and stripping internal proxy headers
         let host_val = target.to_http_authority_bytes();
         write!(&mut fwd_headers, "Host: {}\r\n", String::from_utf8_lossy(&host_val)).ok();
 
         for h in req.headers.iter() {
-            if !h.name.eq_ignore_ascii_case("Host") && !h.name.eq_ignore_ascii_case("Proxy-Connection") {
+            if !h.name.eq_ignore_ascii_case("Host")
+                && !h.name.eq_ignore_ascii_case("Proxy-Connection")
+                && !h.name.eq_ignore_ascii_case("Proxy-Authorization")
+                && !h.name.eq_ignore_ascii_case("X-Resin-Account")
+            {
                 fwd_headers.extend_from_slice(h.name.as_bytes());
                 fwd_headers.extend_from_slice(b": ");
                 fwd_headers.extend_from_slice(h.value);
@@ -97,39 +128,4 @@ impl ReverseProxyHandler {
 
         Ok(())
     }
-}
-
-fn parse_reverse_target(
-    path: &str,
-    headers: &[httparse::Header],
-) -> Result<(TargetAddr, String), InboundError> {
-    // 1. Path-based: /target/example.com:443/hello?foo=bar
-    if let Some(stripped) = path.strip_prefix("/target/") {
-        let (target_str, remaining_path) = match stripped.find('/') {
-            Some(idx) => (&stripped[..idx], &stripped[idx..]),
-            None => (stripped, "/"),
-        };
-
-        let target = TargetAddr::parse_authority(target_str).ok_or_else(|| {
-            InboundError::MalformedRequest(format!("Invalid target authority: {target_str}"))
-        })?;
-
-        return Ok((target, remaining_path.to_string()));
-    }
-
-    // 2. Host-header based
-    for h in headers {
-        if h.name.eq_ignore_ascii_case("Host") {
-            let host_str = std::str::from_utf8(h.value)
-                .map_err(|_| InboundError::MalformedRequest("Host header not UTF-8".into()))?;
-            let target = TargetAddr::parse_authority(host_str).ok_or_else(|| {
-                InboundError::MalformedRequest(format!("Invalid Host header: {host_str}"))
-            })?;
-            return Ok((target, path.to_string()));
-        }
-    }
-
-    Err(InboundError::MalformedRequest(
-        "Could not determine reverse proxy target from path or Host header".into(),
-    ))
 }

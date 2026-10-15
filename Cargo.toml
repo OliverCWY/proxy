@@ -16,6 +16,8 @@ dashmap = "6.2.1"
 derive_more = { version = "2.1.1", features = ["from"] }
 fastrand = "2.5.0"
 httparse = "1.10.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 itoa = "1.0.18"
 memchr = "2.8.3"
 mime_guess = "2.0.5"

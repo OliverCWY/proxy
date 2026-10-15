@@ -1,4 +1,5 @@
 pub mod http;
+pub mod prefixed;
 pub mod socks5;
 
 use tokio::{io::BufReader, net::TcpStream};

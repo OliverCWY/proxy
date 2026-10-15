@@ -314,7 +314,7 @@ async fn test_reverse_proxy_path_routing() {
     let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_port = gateway.local_addr().unwrap().port();
 
-    let rev = Arc::new(ReverseProxyHandler::new(pool, None));
+    let rev = Arc::new(ReverseProxyHandler::new(pool, None, None, None));
 
     tokio::spawn(async move {
         while let Ok((socket, _)) = gateway.accept().await {
@@ -599,4 +599,165 @@ async fn test_td_ewma_score_and_p2c_selection() {
         }
     }
     assert_eq!(selected_node1, 100, "Fast node with lower TD-EWMA score must win in P2C");
+}
+
+#[tokio::test]
+async fn test_single_port_multiplexing_and_resin_reverse_proxy() {
+    use proxy::{
+        forward::ForwardHandler,
+        inbound::{InboundSession, sniff_inbound},
+        outbound::{OutboundNodeConfig, OutboundProtocol},
+        pool::{ProxyNode, ProxyPool},
+        reverse::{ReverseProxyHandler, rules::{AccountMatcherRuntime, AccountRule}},
+    };
+
+    // 1. Mock upstream HTTP service
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = echo_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n > 0 {
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let body = format!("ECHO: {}", req_str.lines().next().unwrap_or(""));
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    // 2. Setup gateway pool & rules
+    let pool = Arc::new(ProxyPool::new(vec![Arc::new(ProxyNode::new(
+        0,
+        "direct",
+        OutboundNodeConfig {
+            dial_addrs: Arc::from(vec![].into_boxed_slice()),
+            protocol: OutboundProtocol::Direct,
+        },
+    ))]));
+
+    let rules_runtime = Arc::new(AccountMatcherRuntime::new(&[AccountRule {
+        url_prefix: "*".into(),
+        headers: vec!["Authorization".into()],
+    }]));
+
+    let proxy_token = "secret-proxy-token".to_string();
+
+    let forward_handler = Arc::new(ForwardHandler::new(pool.clone(), None));
+    let reverse_handler = Arc::new(ReverseProxyHandler::new(
+        pool.clone(),
+        Some(rules_runtime.clone()),
+        Some(proxy_token.clone()),
+        None,
+    ));
+
+    // 3. Bind single gateway port
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_port = listener.local_addr().unwrap().port();
+
+    let api_state = proxy::api::AppState {
+        pool: pool.clone(),
+        rules_runtime: rules_runtime.clone(),
+        admin_token: None,
+        proxy_port: gateway_port,
+    };
+    let api_router = proxy::api::create_api_router(api_state);
+
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let fwd = forward_handler.clone();
+            let rev = reverse_handler.clone();
+            let router = api_router.clone();
+
+            tokio::spawn(async move {
+                match sniff_inbound(socket).await {
+                    Ok(InboundSession::Socks5(handshake)) => {
+                        let _ = fwd.handle_socks5(handshake).await;
+                    }
+                    Ok(InboundSession::Http(handshake)) => {
+                        match handshake.parse().await {
+                            Ok(proxy::inbound::http::HttpInboundSession::Connect(session)) => {
+                                let _ = fwd.handle_http_connect(session).await;
+                            }
+                            Ok(proxy::inbound::http::HttpInboundSession::Admin(admin_stream)) => {
+                                proxy::api::serve_single_connection(admin_stream, router).await;
+                            }
+                            Ok(proxy::inbound::http::HttpInboundSession::Reverse(rev_req)) => {
+                                if let Err(e) = rev.handle(rev_req).await {
+                                    eprintln!("[DEBUG rev.handle ERR]: {e:?}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[DEBUG handshake.parse ERR]: {e:?}");
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+
+    // Test A: Admin endpoint on the SAME single port
+    let info_resp: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{gateway_port}/api/v1/system/info"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info_resp["status"], "healthy");
+
+    // Test B: Prometheus /metrics on the SAME single port
+    let metrics_resp = client
+        .get(format!("http://127.0.0.1:{gateway_port}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics_resp.contains("proxy_nodes_total"));
+
+    // Test C: Web UI /ui/ on the SAME single port
+    let ui_resp = client
+        .get(format!("http://127.0.0.1:{gateway_port}/ui/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ui_resp.status(), 200);
+
+    // Test D: Resin V1 reverse proxy request: /{token}/{platform.account}/{protocol}/{host}/{path}
+    let resin_url = format!(
+        "http://127.0.0.1:{gateway_port}/{proxy_token}/myPlatform.alice/http/127.0.0.1:{echo_port}/api/greet?foo=bar"
+    );
+    let rev_resp = client.get(&resin_url).send().await.unwrap();
+    assert_eq!(rev_resp.status(), 200);
+    let rev_text = rev_resp.text().await.unwrap();
+    assert!(rev_text.contains("ECHO: GET /api/greet?foo=bar HTTP/1.1"));
+
+    // Verify Sticky lease was created for "alice"
+    assert!(pool.leases().get_lease("alice").is_some());
+
+    // Test E: Reverse proxy with WRONG token should fail with connection refused or 403
+    let wrong_token_url = format!(
+        "http://127.0.0.1:{gateway_port}/invalidToken/myPlatform.bob/http/127.0.0.1:{echo_port}/test"
+    );
+    let wrong_resp = client.get(&wrong_token_url).send().await;
+    // Client should receive error or disconnected
+    assert!(wrong_resp.is_err() || !wrong_resp.unwrap().status().is_success());
 }
