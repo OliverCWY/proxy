@@ -35,7 +35,7 @@ impl Socks5InitState {
     // wait for rfc to be merged
     fn no_supported_method() -> InboundResult<()> {
         // should respond with no supported method
-        return Err(IncorrectFormat("No supported method is provided").into());
+        Err(IncorrectFormat("No supported method is provided").into())
     }
 
     async fn handshake(&mut self) -> InboundResult<HandShakeMethods> {
@@ -72,13 +72,13 @@ impl Socks5InitState {
         Ok(HandShakeMethods { no_auth, pass })
     }
 
-    pub(super) async fn handshake_no_auth(mut self) -> InboundResult<Socks5AuthedState> {
+    pub(super) async fn handshake_no_auth(mut self) -> InboundResult<Socks5PendingAuthState> {
         let methods = self.handshake().await?;
         if !methods.no_auth {
             Self::no_supported_method()?;
         }
         self.stream.write_all(&[0x05, 0x00]).await?;
-        Ok(Socks5AuthedState {
+        Ok(Socks5PendingAuthState {
             stream: self.stream,
             pass_authed: false,
         })
@@ -86,14 +86,15 @@ impl Socks5InitState {
 
     pub(super) async fn handshake_must_auth(
         mut self,
-    ) -> InboundResult<(Socks5AuthedState, InboundAuth)> {
+    ) -> InboundResult<(Socks5PendingAuthState, InboundAuth)> {
         let methods = self.handshake().await?;
         if !methods.pass {
             Self::no_supported_method()?;
         }
         let reader = &mut self.stream;
+        reader.write_all(&[0x05, 0x02]).await?;
         let ver = reader.read_u8().await?;
-        if ver == 0x01 {
+        if ver != 0x01 {
             return Err(
                 IncorrectFormatWithData("Incorrect version", vec![ver].into_boxed_slice()).into(),
             );
@@ -108,9 +109,9 @@ impl Socks5InitState {
         let pass = str::from_utf8(&pass[..plen])?.to_string();
 
         Ok((
-            Socks5AuthedState {
+            Socks5PendingAuthState {
                 stream: self.stream,
-                pass_authed: false,
+                pass_authed: true,
             },
             InboundAuth { user, pass },
         ))
@@ -119,12 +120,12 @@ impl Socks5InitState {
     // TODO: possible may_auth
 }
 
-pub struct Socks5AuthedState {
+pub struct Socks5PendingAuthState {
     stream: BufReader<TcpStream>,
     pass_authed: bool,
 }
 
-impl Socks5AuthedState {
+impl Socks5PendingAuthState {
     pub(super) async fn get_target(mut self) -> InboundResult<(Socks5ReadyState, Endpoint)> {
         let reader = &mut self.stream;
         if self.pass_authed {
@@ -145,7 +146,6 @@ impl Socks5AuthedState {
             0x01 => {
                 let mut bytes = [0u8; 4];
                 reader.read_exact(&mut bytes).await?;
-                reader.write_all(&bytes).await?;
                 let ip = Ipv4Addr::from(bytes);
                 Host::Ipv4(ip)
             }
@@ -159,7 +159,6 @@ impl Socks5AuthedState {
             0x04 => {
                 let mut bytes = [0u8; 16];
                 reader.read_exact(&mut bytes).await?;
-                reader.write_all(&bytes).await?;
                 let ip = Ipv6Addr::from(bytes);
                 Host::Ipv6(ip)
             }
@@ -176,10 +175,7 @@ impl Socks5AuthedState {
 
         dbg!(port);
 
-        let endpoint = Endpoint {
-            host: Host::Domain("".to_string().into()),
-            port: 1,
-        };
+        let endpoint = Endpoint { host, port };
 
         Ok((
             Socks5ReadyState {

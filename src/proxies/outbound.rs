@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ptr::addr_eq, sync::Arc};
 
 use arrayvec::ArrayVec;
 use async_trait::async_trait;
@@ -52,7 +52,7 @@ pub enum SimpleProxy {
         /// Or completely empty for no-auth
         auth: Auth,
         endpoint: Endpoint,
-        dns: bool,
+        use_server_proxy: bool,
     },
 }
 
@@ -128,6 +128,7 @@ impl SimpleProxy {
         proxy: &Endpoint,
         auth: &Auth,
         target: &Endpoint,
+        use_server_proxy: bool,
     ) -> OutboundResult<TcpStream> {
         let mut stream = TcpStream::connect(proxy.get_socket_addr().await?.as_slice()).await?;
 
@@ -160,7 +161,20 @@ impl SimpleProxy {
         }
 
         let mut connect_buffer = ArrayVec::<u8, 270>::new();
-        target.fill_socks5_connect_buffer(&mut connect_buffer);
+        connect_buffer.extend([0x05, 0x01, 0x00]);
+
+        let mut target_bytes_written = false;
+        if !use_server_proxy {
+            let addrs = target.get_socket_addr().await?;
+            if let Some(addr) = addrs.into_iter().next() {
+                Endpoint::from(addr).fill_socks5_connect_buffer(&mut connect_buffer);
+                target_bytes_written = true;
+            }
+        }
+        if !target_bytes_written {
+            target.fill_socks5_connect_buffer(&mut connect_buffer);
+        }
+
         stream.write_all(&connect_buffer).await?;
 
         let ver = stream.read_u8().await?;
@@ -199,9 +213,8 @@ impl SimpleProxy {
     }
 }
 
-#[async_trait]
-impl OutboundProxy for SimpleProxy {
-    async fn connect(&self, target: &Endpoint) -> OutboundResult<impl IoStream> {
+impl SimpleProxy {
+    async fn connect_inner(&self, target: &Endpoint) -> anyhow::Result<TcpStream> {
         use SimpleProxy::*;
         match self {
             NoProxy => Ok(TcpStream::connect(target.get_socket_addr().await?.as_slice()).await?),
@@ -212,8 +225,15 @@ impl OutboundProxy for SimpleProxy {
             Socks5 {
                 auth,
                 endpoint,
-                dns: _dns,
-            } => Self::connect_socks5_outbound(endpoint, auth, target).await,
+                use_server_proxy,
+            } => Self::connect_socks5_outbound(endpoint, auth, target, *use_server_proxy).await,
         }
+    }
+}
+
+#[async_trait]
+impl OutboundProxy for SimpleProxy {
+    async fn connect(&self, target: &Endpoint) -> OutboundResult<impl IoStream> {
+        self.connect_inner(target).await
     }
 }

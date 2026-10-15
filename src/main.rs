@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
                             copy_bidirectional(&mut proxy_stream, &mut client)
                                 .await
                                 .map(|_| ())
-                                .map_err(|e| anyhow::Error::from(e))
+                                .map_err(anyhow::Error::from)
                         }
                         Err(e) => ready.fail(e).await,
                     }

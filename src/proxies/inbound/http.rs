@@ -49,7 +49,7 @@ impl HttpInitState {
         Self { stream }
     }
 
-    pub(super) async fn handshake(self) -> InboundResult<(HttpAuthedState, Option<InboundAuth>)> {
+    pub async fn handshake(self) -> InboundResult<(HttpPendingAuthState, Option<InboundAuth>)> {
         let mut stream = BufReader::new(self.stream);
         let reader = &mut stream;
         let mut header_size = 0usize;
@@ -90,7 +90,7 @@ impl HttpInitState {
         loop {
             read_line(reader, &mut line, &mut header_size).await?;
             if line.is_empty() {
-                return Ok((HttpAuthedState { stream, target }, auth));
+                return Ok((HttpPendingAuthState { stream, target }, auth));
             }
             let err_fn = || incorrect_format("Incorrect header line: ", &line);
             let pos = memchr::memchr(b':', &line).ok_or_else(err_fn)?;
@@ -112,9 +112,14 @@ impl HttpInitState {
                 }
                 use base64::prelude::*;
                 let auth_bytes = BASE64_STANDARD.decode(&value[6..])?;
-                let colon_pos = memchr::memchr(b':', &auth_bytes).ok_or_else(err_fn)?;
-                let user = String::from_utf8(Vec::from(&auth_bytes[..colon_pos]))?;
-                let pass = String::from_utf8(Vec::from(&auth_bytes[colon_pos + 1..]))?;
+                let (user, pass) = match memchr::memchr(b':', &auth_bytes) {
+                    None => (str::from_utf8(&auth_bytes)?.to_string(), "".to_string()),
+                    Some(colon_pos) => {
+                        let user = str::from_utf8(&auth_bytes[..colon_pos])?;
+                        let pass = str::from_utf8(&auth_bytes[colon_pos + 1..])?;
+                        (user.to_string(), pass.to_string())
+                    }
+                };
                 auth = Some(InboundAuth { user, pass });
             };
             line.clear()
@@ -122,12 +127,12 @@ impl HttpInitState {
     }
 }
 
-pub struct HttpAuthedState {
+pub struct HttpPendingAuthState {
     stream: BufReader<TcpStream>,
     target: Endpoint,
 }
 
-impl HttpAuthedState {
+impl HttpPendingAuthState {
     pub fn get_target(self) -> (HttpReadyState, Endpoint) {
         (
             HttpReadyState {
@@ -143,13 +148,13 @@ pub struct HttpReadyState {
 }
 
 impl HttpReadyState {
-    pub(super) async fn success(mut self) -> InboundResult<BufReader<TcpStream>> {
+    pub async fn success(mut self) -> InboundResult<BufReader<TcpStream>> {
         self.stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         Ok(self.stream)
     }
-    pub(super) async fn fail(mut self, error: OutboundError) -> InboundResult<()> {
+    pub async fn fail(mut self, error: OutboundError) -> InboundResult<()> {
         todo!()
     }
 }

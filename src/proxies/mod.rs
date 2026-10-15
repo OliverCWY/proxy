@@ -16,11 +16,20 @@ pub mod utils;
 pub const MAX_EXPECTED_AUTH_HEADER_LENGTH: usize = 512;
 pub const MAX_EXPECTED_DOMAIN_SIZE: usize = 64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
     Ipv4(Ipv4Addr),
     Ipv6(Ipv6Addr),
     Domain(Arc<str>),
+}
+
+impl From<IpAddr> for Host {
+    fn from(value: IpAddr) -> Self {
+        match value {
+            IpAddr::V4(ip) => Self::Ipv4(ip),
+            IpAddr::V6(ip) => Self::Ipv6(ip),
+        }
+    }
 }
 
 impl From<&str> for Host {
@@ -33,7 +42,7 @@ impl From<&str> for Host {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub host: Host,
     pub port: u16,
@@ -52,17 +61,24 @@ impl Endpoint {
                 },
             ),
             Some(pos) => {
-                // safety: from original string, separated by ':'
-                let host = unsafe { str::from_utf8_unchecked(&endpoint_bytes[..pos]) };
-                let port = unsafe { str::from_utf8_unchecked(&endpoint_bytes[pos + 1..]) }
-                    .parse()
-                    .ok()?;
+                let host = &endpoint_str[..pos];
+                let port = endpoint_str[pos + 1..].parse().ok()?;
 
                 (host.into(), port)
             }
         };
 
         Some(Self { host, port })
+    }
+}
+
+impl From<SocketAddr> for Endpoint {
+    fn from(value: SocketAddr) -> Self {
+        let host = value.ip().into();
+        Endpoint {
+            host,
+            port: value.port(),
+        }
     }
 }
 
@@ -87,7 +103,7 @@ impl Endpoint {
             Ipv6(ip) => write!((&mut res).writer(), "[{}]", ip)?,
             Domain(domain) => res.extend_from_slice(domain.as_bytes()),
         }
-        res.put([b':'].as_slice());
+        res.put(b":".as_slice());
         let mut port = itoa::Buffer::new();
         let port = port.format(self.port);
         res.put_slice(port.as_bytes());
@@ -109,7 +125,7 @@ impl Endpoint {
             Domain(domain) => {
                 buffer.push(0x03);
                 buffer.push(domain.len() as u8);
-                buffer.extend(domain.as_bytes().into_iter().cloned());
+                buffer.extend(domain.as_bytes().iter().copied());
             }
         }
         buffer.extend(self.port.to_be_bytes());

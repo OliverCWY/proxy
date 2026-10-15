@@ -16,8 +16,9 @@ fn generate_http_auth(auth: &[u8]) -> Arc<[u8]> {
     use base64::prelude::*;
     let base64_auth = BASE64_STANDARD.encode(auth);
     let mut http_auth = Vec::from(b"Proxy-Authorization: Basic ");
-    http_auth.reserve(base64_auth.len());
+    http_auth.reserve(base64_auth.len() + 2);
     http_auth.extend(base64_auth.as_bytes());
+    http_auth.extend(b"\r\n");
     http_auth.into()
 }
 
@@ -64,7 +65,7 @@ pub fn parse_proxy(proxy: &str) -> Option<SimpleProxy> {
         Proto::Socks5 | Proto::Socks5h => Some(SimpleProxy::Socks5 {
             auth: auth.map_or_default(generate_socks5_auth),
             endpoint,
-            dns: proto == Proto::Socks5h,
+            use_server_proxy: proto == Proto::Socks5h,
         }),
         Proto::Https => None,
     }

@@ -6,18 +6,20 @@ use crate::proxies::{
     Endpoint,
     inbound::{
         InboundError::NoAuthProvided,
-        http::{HttpAuthedState, HttpInitState, HttpReadyState},
-        socks5::{Socks5AuthedState, Socks5InitState, Socks5ReadyState},
+        http::{HttpInitState, HttpPendingAuthState, HttpReadyState},
+        socks5::{Socks5InitState, Socks5PendingAuthState, Socks5ReadyState},
     },
     outbound::OutboundError,
 };
 
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct InboundAuth {
     pub user: String,
     pub pass: String,
 }
 
-mod http;
+pub mod http;
+
 mod socks5;
 
 #[derive(Error, Debug)]
@@ -47,9 +49,9 @@ pub enum InboundInitState {
 }
 
 #[derive(From)]
-pub enum InboundAuthedState {
-    Http(HttpAuthedState),
-    Socks5(Socks5AuthedState),
+pub enum InboundPendingAuthState {
+    Http(HttpPendingAuthState),
+    Socks5(Socks5PendingAuthState),
 }
 
 #[derive(From)]
@@ -62,10 +64,11 @@ impl InboundType {
     pub async fn new(stream: TcpStream) -> InboundResult<Self> {
         let mut buf = [0u8; 8];
         stream.peek(&mut buf).await?;
+        let _ = dbg!(str::from_utf8(&buf));
         let inbound_type = match buf[0] {
-            0x05 => InboundInitState::Http(HttpInitState::new(stream)).into(),
+            0x05 => InboundInitState::Socks5(Socks5InitState::new(stream)).into(),
             b'C' if buf.starts_with(b"CONNECT ") => {
-                InboundInitState::Socks5(Socks5InitState::new(stream)).into()
+                InboundInitState::Http(HttpInitState::new(stream)).into()
             }
             _ => Self::Reverse(stream),
         };
@@ -75,13 +78,15 @@ impl InboundType {
 }
 
 impl InboundInitState {
-    pub async fn handshake_no_auth(self) -> InboundResult<InboundAuthedState> {
+    pub async fn handshake_no_auth(self) -> InboundResult<InboundPendingAuthState> {
         match self {
             Self::Http(http) => Ok(http.handshake().await?.0.into()),
             Self::Socks5(socks5) => Ok(socks5.handshake_no_auth().await?.into()),
         }
     }
-    pub async fn handshake_must_auth(self) -> InboundResult<(InboundAuthedState, InboundAuth)> {
+    pub async fn handshake_must_auth(
+        self,
+    ) -> InboundResult<(InboundPendingAuthState, InboundAuth)> {
         match self {
             Self::Http(http) => {
                 let (next, auth) = http.handshake().await?;
@@ -99,7 +104,7 @@ impl InboundInitState {
     }
 }
 
-impl InboundAuthedState {
+impl InboundPendingAuthState {
     pub async fn reject(self) -> InboundResult<()> {
         todo!()
     }
