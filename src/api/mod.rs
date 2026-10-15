@@ -31,6 +31,7 @@ pub fn create_api_router(state: AppState) -> Router {
         .route("/ui", get(webui::ui_root_redirect))
         .route("/ui/", get(webui::static_handler))
         .route("/ui/{*path}", get(webui::static_handler))
+        .route("/metrics", get(prometheus_metrics))
         .route("/api/v1/system/info", get(get_system_info))
         .route("/api/v1/nodes", get(list_nodes))
         .route("/api/v1/nodes/{id}/actions/probe", post(probe_node))
@@ -83,6 +84,7 @@ pub struct NodeSummary {
     pub successful_requests: u64,
     pub consecutive_failures: usize,
     pub active_connections: usize,
+    pub latency_ewma_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -163,6 +165,7 @@ async fn list_nodes(
             successful_requests: n.stats.successful_requests.load(std::sync::atomic::Ordering::Relaxed),
             consecutive_failures: n.stats.consecutive_failures.load(std::sync::atomic::Ordering::Relaxed),
             active_connections: n.stats.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+            latency_ewma_ms: n.stats.latency_ewma_ms.load(std::sync::atomic::Ordering::Relaxed),
         })
         .collect();
 
@@ -353,4 +356,70 @@ async fn sync_subscription(
         imported_count,
         total_nodes: state.pool.node_count(),
     }))
+}
+
+// 6. Prometheus Metrics Endpoint
+async fn prometheus_metrics(State(state): State<AppState>) -> (axum::http::HeaderMap, String) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+
+    let all_nodes = (0..=10000)
+        .filter_map(|id| state.pool.find_node(id))
+        .collect::<Vec<_>>();
+
+    let total_nodes = all_nodes.len();
+    let mut healthy_nodes = 0;
+    let mut cooldown_nodes = 0;
+    for n in &all_nodes {
+        match n.status() {
+            NodeHealthStatus::Healthy | NodeHealthStatus::HalfOpen => healthy_nodes += 1,
+            NodeHealthStatus::Cooldown => cooldown_nodes += 1,
+        }
+    }
+    let active_leases = state.pool.leases().sweep_expired();
+
+    let mut out = String::with_capacity(2048);
+    out.push_str("# HELP proxy_nodes_total Total number of proxy nodes\n");
+    out.push_str("# TYPE proxy_nodes_total gauge\n");
+    out.push_str(&format!("proxy_nodes_total {total_nodes}\n\n"));
+
+    out.push_str("# HELP proxy_nodes_healthy Number of healthy/available proxy nodes\n");
+    out.push_str("# TYPE proxy_nodes_healthy gauge\n");
+    out.push_str(&format!("proxy_nodes_healthy {healthy_nodes}\n\n"));
+
+    out.push_str("# HELP proxy_nodes_cooldown Number of cooling down proxy nodes\n");
+    out.push_str("# TYPE proxy_nodes_cooldown gauge\n");
+    out.push_str(&format!("proxy_nodes_cooldown {cooldown_nodes}\n\n"));
+
+    out.push_str("# HELP proxy_sticky_leases_active Number of active sticky session leases\n");
+    out.push_str("# TYPE proxy_sticky_leases_active gauge\n");
+    out.push_str(&format!("proxy_sticky_leases_active {active_leases}\n\n"));
+
+    out.push_str("# HELP proxy_node_latency_ewma_ms Smoothed TD-EWMA latency in milliseconds\n");
+    out.push_str("# TYPE proxy_node_latency_ewma_ms gauge\n");
+    for n in &all_nodes {
+        let ewma = n.stats.latency_ewma_ms.load(std::sync::atomic::Ordering::Relaxed);
+        out.push_str(&format!("proxy_node_latency_ewma_ms{{id=\"{}\",tag=\"{}\"}} {ewma}\n", n.id, n.tag));
+    }
+    out.push('\n');
+
+    out.push_str("# HELP proxy_node_requests_total Total requests routed to node\n");
+    out.push_str("# TYPE proxy_node_requests_total counter\n");
+    for n in &all_nodes {
+        let reqs = n.stats.total_requests.load(std::sync::atomic::Ordering::Relaxed);
+        out.push_str(&format!("proxy_node_requests_total{{id=\"{}\",tag=\"{}\"}} {reqs}\n", n.id, n.tag));
+    }
+    out.push('\n');
+
+    out.push_str("# HELP proxy_node_active_connections Number of active connections on node\n");
+    out.push_str("# TYPE proxy_node_active_connections gauge\n");
+    for n in &all_nodes {
+        let conns = n.stats.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+        out.push_str(&format!("proxy_node_active_connections{{id=\"{}\",tag=\"{}\"}} {conns}\n", n.id, n.tag));
+    }
+
+    (headers, out)
 }

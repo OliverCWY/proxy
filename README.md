@@ -13,8 +13,9 @@ Unlike traditional proxy gateways (e.g. Resin) that log high-frequency request d
 - **DashMap** concurrent hash maps for $O(1)$ sticky session leasing.
 - **Atomic ArcSwap** for lock-free, zero-copy node snapshot rotation.
 
-### 2. O(1) Same Egress IP Failover
-Maintains an in-memory inverse index (`DashMap<IpAddr, SmallVec<[usize; 4]>>`) mapping public egress IPs to candidate node indices. When an upstream proxy connection encounters network errors, the engine seamlessly rotates to an alternative proxy node sharing the **identical public egress IP**, preserving tenant sessions and preventing IP-bound bans.
+### 2. O(1) Same Egress IP Failover & TD-EWMA Load Balancing
+- **Same Egress IP Failover**: Maintains an in-memory inverse index (`DashMap<IpAddr, SmallVec<[usize; 4]>>`) mapping public egress IPs to candidate node indices. When an upstream proxy connection encounters network errors, the engine seamlessly rotates to an alternative proxy node sharing the **identical public egress IP**, preserving tenant sessions.
+- **TD-EWMA (Time-Decay EWMA) Scoring**: Measures live RTT per upstream dial and computes exponential time-decay smoothed latency. The P2C (Power of Two Choices) scheduler compares combined scores $(EWMA + 1) \cdot (ActiveConns + 1) \cdot 2^{Failures}$ to dynamically route away from congested or degrading nodes.
 
 ### 3. Single-Port Protocol Sniffing
 Listens on a single port (default: `1099`) and sniffs incoming traffic:
@@ -60,6 +61,7 @@ The control plane is served over Axum on port `1100`:
 | Endpoint | Method | Description |
 | :--- | :---: | :--- |
 | `/ui/*` | `GET` | Single-binary embedded Web UI dashboard |
+| `/metrics` | `GET` | Prometheus metrics endpoint (gauges, counters, TD-EWMA RTT) |
 | `/api/v1/system/info` | `GET` | Gateway version, uptime, total nodes, listen ports |
 | `/api/v1/nodes` | `GET` | Node list with status, dial addresses, active connections, and consecutive failure counts |
 | `/api/v1/nodes/:id/actions/probe` | `POST` | Trigger immediate active health probe for a specific node |

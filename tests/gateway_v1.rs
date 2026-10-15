@@ -540,4 +540,63 @@ async fn test_admin_api_endpoints_and_rule_sandbox() {
     // Missing file with extension -> should return 404
     let missing_resp = client.get(format!("{base}/ui/missing-image.png")).send().await.unwrap();
     assert_eq!(missing_resp.status(), 404);
+
+    // 6. Prometheus /metrics Endpoint Test
+    let metrics_resp = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(metrics_resp.status(), 200);
+    let metrics_text = metrics_resp.text().await.unwrap();
+    assert!(metrics_text.contains("proxy_nodes_total"));
+    assert!(metrics_text.contains("proxy_nodes_healthy"));
+    assert!(metrics_text.contains("proxy_node_latency_ewma_ms"));
+}
+
+#[tokio::test]
+async fn test_td_ewma_score_and_p2c_selection() {
+    use proxy::pool::node::ProxyNode;
+    use proxy::pool::selector::{PowerOfTwoChoices, Selector};
+    use proxy::outbound::{OutboundNodeConfig, OutboundProtocol};
+    use std::time::Duration;
+
+    let node1 = Arc::new(ProxyNode::new(
+        1,
+        "fast-node",
+        OutboundNodeConfig {
+            dial_addrs: Arc::from(vec![].into_boxed_slice()),
+            protocol: OutboundProtocol::Direct,
+        },
+    ));
+
+    let node2 = Arc::new(ProxyNode::new(
+        2,
+        "slow-node",
+        OutboundNodeConfig {
+            dial_addrs: Arc::from(vec![].into_boxed_slice()),
+            protocol: OutboundProtocol::Direct,
+        },
+    ));
+
+    // Fast node has low latency samples
+    node1.mark_success_with_rtt(Duration::from_millis(10));
+    node1.mark_success_with_rtt(Duration::from_millis(15));
+
+    // Slow node has high latency samples
+    node2.mark_success_with_rtt(Duration::from_millis(800));
+    node2.mark_success_with_rtt(Duration::from_millis(900));
+
+    // Node 1 should have much lower score than Node 2
+    assert!(node1.calculate_score() < node2.calculate_score());
+
+    let selector = PowerOfTwoChoices;
+    let nodes = vec![node1.clone(), node2.clone()];
+
+    // Over multiple choices, fast node should be selected consistently
+    let mut selected_node1 = 0;
+    for _ in 0..100 {
+        if let Some(chosen) = selector.select(&nodes) {
+            if chosen.id == 1 {
+                selected_node1 += 1;
+            }
+        }
+    }
+    assert_eq!(selected_node1, 100, "Fast node with lower TD-EWMA score must win in P2C");
 }

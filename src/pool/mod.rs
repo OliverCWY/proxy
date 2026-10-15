@@ -120,11 +120,12 @@ impl ProxyPool {
             if let Some(node) = self.find_node(lease.node_id) {
                 if node.is_available() {
                     node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                    let start = std::time::Instant::now();
                     let res = OutboundConnector::connect(&node.config, target, self.connect_timeout).await;
                     node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
 
                     if let Ok((stream, residual)) = res {
-                        node.mark_success();
+                        node.mark_success_with_rtt(start.elapsed());
                         return Ok((stream, residual, node));
                     }
                     node.mark_failure(self.max_consecutive_failures, self.base_cooldown);
@@ -141,11 +142,12 @@ impl ProxyPool {
                     if let Some(node) = self.find_node(cand_id) {
                         if node.is_available() {
                             node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                            let start = std::time::Instant::now();
                             let res = OutboundConnector::connect(&node.config, target, self.connect_timeout).await;
                             node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
 
                             if let Ok((stream, residual)) = res {
-                                node.mark_success();
+                                node.mark_success_with_rtt(start.elapsed());
                                 self.leases.rotate_lease_node(account, cand_id);
                                 return Ok((stream, residual, node));
                             }
@@ -211,12 +213,13 @@ impl ProxyPool {
             tried_node_ids.insert(node.id);
             node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
+            let start = std::time::Instant::now();
             let res = OutboundConnector::connect(&node.config, target, self.connect_timeout).await;
             node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
 
             match res {
                 Ok((stream, residual)) => {
-                    node.mark_success();
+                    node.mark_success_with_rtt(start.elapsed());
                     return Ok((stream, residual, node));
                 }
                 Err(err) => {

@@ -342,6 +342,7 @@ onMounted(() => {
                 <th class="px-5 py-3.5">Requests</th>
                 <th class="px-5 py-3.5">Failures</th>
                 <th class="px-5 py-3.5">Active Conns</th>
+                <th class="px-5 py-3.5">TD-EWMA RTT</th>
                 <th class="px-5 py-3.5">Actions</th>
               </tr>
             </thead>
@@ -365,6 +366,7 @@ onMounted(() => {
                 <td class="px-5 py-3.5">{{ node.total_requests }}</td>
                 <td class="px-5 py-3.5">{{ node.consecutive_failures }}</td>
                 <td class="px-5 py-3.5">{{ node.active_connections }}</td>
+                <td class="px-5 py-3.5 font-mono text-xs text-sky-400">{{ node.latency_ewma_ms }}ms</td>
                 <td class="px-5 py-3.5">
                   <button
                     class="inline-flex items-center gap-1.5 rounded border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-slate-700 disabled:opacity-50"
@@ -377,7 +379,7 @@ onMounted(() => {
                 </td>
               </tr>
               <tr v-if="nodesList.length === 0">
-                <td colspan="8" class="px-5 py-8 text-center text-slate-500">No nodes matching filter</td>
+                <td colspan="9" class="px-5 py-8 text-center text-slate-500">No nodes matching filter</td>
               </tr>
             </tbody>
           </table>

@@ -53,10 +53,8 @@ impl Selector for PowerOfTwoChoices {
         let n1 = &nodes[idx1];
         let n2 = &nodes[idx2];
 
-        let score1 = n1.stats.consecutive_failures.load(std::sync::atomic::Ordering::Relaxed) * 10
-            + n1.stats.active_connections.load(std::sync::atomic::Ordering::Relaxed);
-        let score2 = n2.stats.consecutive_failures.load(std::sync::atomic::Ordering::Relaxed) * 10
-            + n2.stats.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+        let score1 = n1.calculate_score();
+        let score2 = n2.calculate_score();
 
         if score1 <= score2 {
             Some(n1)
