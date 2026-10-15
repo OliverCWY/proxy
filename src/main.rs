@@ -179,6 +179,35 @@ async fn main() -> anyhow::Result<()> {
     let forward_handler = Arc::new(ForwardHandler::new(pool.clone(), inbound_auth.clone()));
     let reverse_handler = Arc::new(ReverseProxyHandler::new(pool.clone(), inbound_auth));
 
+    let admin_port = std::env::var("ADMIN_PORT")
+        .or_else(|_| std::env::var("admin_port"))
+        .unwrap_or_else(|_| (port + 1).to_string())
+        .parse::<u16>()?;
+
+    let rules_runtime = Arc::new(proxy::reverse::rules::AccountMatcherRuntime::new(&[
+        proxy::reverse::rules::AccountRule {
+            url_prefix: "*".into(),
+            headers: vec!["Authorization".into(), "x-account-id".into()],
+        }
+    ]));
+
+    let api_state = proxy::api::AppState {
+        pool: pool.clone(),
+        rules_runtime: rules_runtime.clone(),
+        admin_token: std::env::var("ADMIN_TOKEN").ok(),
+        proxy_port: port,
+    };
+
+    let api_router = proxy::api::create_api_router(api_state);
+    let admin_listener = TcpListener::bind(("0.0.0.0", admin_port)).await?;
+    println!("[+] Admin API listening on http://0.0.0.0:{}", admin_port);
+
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(admin_listener, api_router).await {
+            eprintln!("[!] Admin API error: {e}");
+        }
+    });
+
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     println!("[+] Proxy gateway listening on 0.0.0.0:{}", port);
 

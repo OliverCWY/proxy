@@ -1,7 +1,8 @@
 use std::{collections::HashMap, net::IpAddr, sync::Arc};
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountRule {
     pub url_prefix: String,
     pub headers: Vec<String>,

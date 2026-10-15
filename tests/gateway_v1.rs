@@ -428,3 +428,102 @@ fn test_account_header_rule_trie_matcher() {
     });
     assert_eq!(account, Some("Bearer my-token-user".into()));
 }
+
+#[tokio::test]
+async fn test_admin_api_endpoints_and_rule_sandbox() {
+    let pool = Arc::new(ProxyPool::new(vec![Arc::new(ProxyNode::new(
+        1,
+        "direct-node",
+        OutboundNodeConfig {
+            dial_addrs: Arc::from(vec![].into_boxed_slice()),
+            protocol: OutboundProtocol::Direct,
+        },
+    ))]));
+
+    let rules_runtime = Arc::new(proxy::reverse::rules::AccountMatcherRuntime::new(&[
+        proxy::reverse::rules::AccountRule {
+            url_prefix: "api.github.com".into(),
+            headers: vec!["x-github-user".into()],
+        },
+        proxy::reverse::rules::AccountRule {
+            url_prefix: "*".into(),
+            headers: vec!["authorization".into()],
+        },
+    ]));
+
+    let state = proxy::api::AppState {
+        pool,
+        rules_runtime,
+        admin_token: None,
+        proxy_port: 1099,
+    };
+
+    let router = proxy::api::create_api_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // 1. System Info
+    let info: serde_json::Value = client
+        .get(format!("{base}/api/v1/system/info"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["status"], "healthy");
+    assert_eq!(info["total_nodes"], 1);
+    assert_eq!(info["anonymous_allowed"], true);
+
+    // 2. Nodes List
+    let nodes: serde_json::Value = client
+        .get(format!("{base}/api/v1/nodes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(nodes["total"], 1);
+    assert_eq!(nodes["items"][0]["tag"], "direct-node");
+
+    // 3. Rule Sandbox Resolve
+    let mut req_body = serde_json::json!({
+        "url": "https://api.github.com/repos/rust-lang/rust",
+        "headers": {
+            "x-github-user": "octocat",
+            "authorization": "Bearer token123"
+        }
+    });
+
+    let res: serde_json::Value = client
+        .post(format!("{base}/api/v1/rules:resolve"))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(res["extracted_account"], "octocat");
+
+    // 4. Fallback rule resolve
+    req_body["url"] = serde_json::json!("https://example.com/api");
+    let res: serde_json::Value = client
+        .post(format!("{base}/api/v1/rules:resolve"))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(res["extracted_account"], "Bearer token123");
+}
