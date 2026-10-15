@@ -71,6 +71,11 @@ impl LeaseTable {
         }
     }
 
+    /// Return current number of active sticky leases
+    pub fn active_count(&self) -> usize {
+        self.leases.len()
+    }
+
     /// Get all live candidate node IDs that share the same Egress IP (O(1) lookup!)
     pub fn get_same_ip_candidates(&self, egress_ip: IpAddr) -> SmallVec<[usize; 4]> {
         self.egress_index

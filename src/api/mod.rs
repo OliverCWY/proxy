@@ -21,26 +21,72 @@ use crate::{
 pub struct AppState {
     pub pool: Arc<ProxyPool>,
     pub rules_runtime: Arc<AccountMatcherRuntime>,
+    pub security: Arc<crate::security::SecurityFilter>,
     pub admin_token: Option<String>,
     pub proxy_port: u16,
 }
 
 pub fn create_api_router(state: AppState) -> Router {
+    let api_v1 = Router::new()
+        .route("/system/info", get(get_system_info))
+        .route("/nodes", get(list_nodes))
+        .route("/nodes/{id}/actions/probe", post(probe_node))
+        .route("/nodes/{id}/actions/block", post(block_node))
+        .route("/nodes/{id}/actions/unblock", post(unblock_node))
+        .route("/security/blacklist", get(list_blacklist).post(add_blacklist))
+        .route("/security/blacklist/{domain}", axum::routing::delete(remove_blacklist))
+        .route("/rules", get(list_rules))
+        .route("/rules/{prefix}", put(upsert_rule).delete(delete_rule))
+        .route("/rules:resolve", post(resolve_rule))
+        .route("/subscriptions/sync", post(sync_subscription))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), admin_auth_middleware));
+
     Router::new()
         .route("/", get(webui::root_redirect))
         .route("/ui", get(webui::ui_root_redirect))
         .route("/ui/", get(webui::static_handler))
         .route("/ui/{*path}", get(webui::static_handler))
         .route("/metrics", get(prometheus_metrics))
-        .route("/api/v1/system/info", get(get_system_info))
-        .route("/api/v1/nodes", get(list_nodes))
-        .route("/api/v1/nodes/{id}/actions/probe", post(probe_node))
-        .route("/api/v1/rules", get(list_rules))
-        .route("/api/v1/rules/{prefix}", put(upsert_rule).delete(delete_rule))
-        .route("/api/v1/rules:resolve", post(resolve_rule))
-        .route("/api/v1/subscriptions/sync", post(sync_subscription))
+        .nest("/api/v1", api_v1)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn admin_auth_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(expected) = &state.admin_token {
+        let mut authenticated = false;
+        // 1. Check Authorization: Bearer <token>
+        if let Some(auth_val) = req.headers().get(axum::http::header::AUTHORIZATION) {
+            if let Ok(auth_str) = auth_val.to_str() {
+                if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                    if token.trim() == expected {
+                        authenticated = true;
+                    }
+                }
+            }
+        }
+        // 2. Check query param ?token=<token>
+        if !authenticated {
+            if let Some(query) = req.uri().query() {
+                for pair in query.split('&') {
+                    if let Some(token) = pair.strip_prefix("token=") {
+                        if token.trim() == expected {
+                            authenticated = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !authenticated {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 /// Serve a single pre-buffered HTTP connection with the Axum router
@@ -82,7 +128,7 @@ async fn get_system_info(State(state): State<AppState>) -> Json<SystemInfoRespon
         status: "healthy",
         anonymous_allowed: state.admin_token.is_none(),
         total_nodes: state.pool.node_count(),
-        active_leases: state.pool.leases().sweep_expired(), // sweeps and reports
+        active_leases: state.pool.leases().active_count(),
         proxy_port: state.proxy_port,
     })
 }
@@ -121,26 +167,22 @@ async fn list_nodes(
     State(state): State<AppState>,
     Query(filters): Query<NodeFilterQuery>,
 ) -> Json<NodeListResponse> {
-    let pool_guard = state.pool.find_node(0); // placeholder load
-    let _ = pool_guard;
-
-    // Collect all nodes from pool snapshot
-    let all_nodes = (0..=10000)
-        .filter_map(|id| state.pool.find_node(id))
-        .collect::<Vec<_>>();
+    // Collect all nodes from pool snapshot directly in O(1)
+    let all_nodes = state.pool.all_nodes();
 
     let mut healthy_count = 0;
     let mut cooldown_count = 0;
 
-    for n in &all_nodes {
+    for n in all_nodes.iter() {
         match n.status() {
             NodeHealthStatus::Healthy | NodeHealthStatus::HalfOpen => healthy_count += 1,
-            NodeHealthStatus::Cooldown => cooldown_count += 1,
+            NodeHealthStatus::Cooldown | NodeHealthStatus::Blocked => cooldown_count += 1,
         }
     }
 
     let mut filtered = all_nodes
-        .into_iter()
+        .iter()
+        .cloned()
         .filter(|n| {
             if let Some(status_filter) = &filters.status {
                 match status_filter.as_str() {
@@ -181,6 +223,7 @@ async fn list_nodes(
                 NodeHealthStatus::Healthy => "healthy",
                 NodeHealthStatus::HalfOpen => "half_open",
                 NodeHealthStatus::Cooldown => "cooldown",
+                NodeHealthStatus::Blocked => "blocked",
             },
             dial_addrs: n.config.dial_addrs.iter().map(|a| a.to_string()).collect(),
             total_requests: n.stats.total_requests.load(std::sync::atomic::Ordering::Relaxed),
@@ -244,14 +287,8 @@ pub struct RulePayload {
     pub headers: Vec<String>,
 }
 
-async fn list_rules(State(_state): State<AppState>) -> Json<Vec<AccountRule>> {
-    // In our in-memory model, we return sample / live rules
-    Json(vec![
-        AccountRule {
-            url_prefix: "*".into(),
-            headers: vec!["Authorization".into(), "x-account-id".into()],
-        }
-    ])
+async fn list_rules(State(state): State<AppState>) -> Json<Vec<AccountRule>> {
+    Json(state.rules_runtime.get_rules())
 }
 
 async fn upsert_rule(
@@ -263,18 +300,22 @@ async fn upsert_rule(
         url_prefix: prefix,
         headers: payload.headers,
     };
-    state.rules_runtime.replace_rules(&[rule]);
+    state.rules_runtime.upsert_rule(rule);
     StatusCode::OK
 }
 
 async fn delete_rule(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(prefix): Path<String>,
 ) -> StatusCode {
     if prefix == "*" {
         return StatusCode::FORBIDDEN; // Wildcard cannot be deleted
     }
-    StatusCode::OK
+    if state.rules_runtime.delete_rule(&prefix) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 #[derive(Deserialize)]
@@ -388,20 +429,18 @@ async fn prometheus_metrics(State(state): State<AppState>) -> (axum::http::Heade
         axum::http::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
 
-    let all_nodes = (0..=10000)
-        .filter_map(|id| state.pool.find_node(id))
-        .collect::<Vec<_>>();
+    let all_nodes = state.pool.all_nodes();
 
     let total_nodes = all_nodes.len();
     let mut healthy_nodes = 0;
     let mut cooldown_nodes = 0;
-    for n in &all_nodes {
+    for n in all_nodes.iter() {
         match n.status() {
             NodeHealthStatus::Healthy | NodeHealthStatus::HalfOpen => healthy_nodes += 1,
-            NodeHealthStatus::Cooldown => cooldown_nodes += 1,
+            NodeHealthStatus::Cooldown | NodeHealthStatus::Blocked => cooldown_nodes += 1,
         }
     }
-    let active_leases = state.pool.leases().sweep_expired();
+    let active_leases = state.pool.leases().active_count();
 
     let mut out = String::with_capacity(2048);
     out.push_str("# HELP proxy_nodes_total Total number of proxy nodes\n");
@@ -422,7 +461,7 @@ async fn prometheus_metrics(State(state): State<AppState>) -> (axum::http::Heade
 
     out.push_str("# HELP proxy_node_latency_ewma_ms Smoothed TD-EWMA latency in milliseconds\n");
     out.push_str("# TYPE proxy_node_latency_ewma_ms gauge\n");
-    for n in &all_nodes {
+    for n in all_nodes.iter() {
         let ewma = n.stats.latency_ewma_ms.load(std::sync::atomic::Ordering::Relaxed);
         out.push_str(&format!("proxy_node_latency_ewma_ms{{id=\"{}\",tag=\"{}\"}} {ewma}\n", n.id, n.tag));
     }
@@ -430,7 +469,7 @@ async fn prometheus_metrics(State(state): State<AppState>) -> (axum::http::Heade
 
     out.push_str("# HELP proxy_node_requests_total Total requests routed to node\n");
     out.push_str("# TYPE proxy_node_requests_total counter\n");
-    for n in &all_nodes {
+    for n in all_nodes.iter() {
         let reqs = n.stats.total_requests.load(std::sync::atomic::Ordering::Relaxed);
         out.push_str(&format!("proxy_node_requests_total{{id=\"{}\",tag=\"{}\"}} {reqs}\n", n.id, n.tag));
     }
@@ -438,10 +477,65 @@ async fn prometheus_metrics(State(state): State<AppState>) -> (axum::http::Heade
 
     out.push_str("# HELP proxy_node_active_connections Number of active connections on node\n");
     out.push_str("# TYPE proxy_node_active_connections gauge\n");
-    for n in &all_nodes {
+    for n in all_nodes.iter() {
         let conns = n.stats.active_connections.load(std::sync::atomic::Ordering::Relaxed);
         out.push_str(&format!("proxy_node_active_connections{{id=\"{}\",tag=\"{}\"}} {conns}\n", n.id, n.tag));
     }
 
     (headers, out)
+}
+
+// 7. Node Block / Unblock Actions
+async fn block_node(
+    State(state): State<AppState>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(node) = state.pool.find_node(id) {
+        node.block();
+        Ok(Json(serde_json::json!({ "success": true, "id": id, "status": "blocked" })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "Node not found".into()))
+    }
+}
+
+async fn unblock_node(
+    State(state): State<AppState>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(node) = state.pool.find_node(id) {
+        node.unblock();
+        Ok(Json(serde_json::json!({ "success": true, "id": id, "status": "healthy" })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "Node not found".into()))
+    }
+}
+
+// 8. Security Blacklist APIs
+#[derive(Deserialize)]
+pub struct AddBlacklistRequest {
+    pub domain: String,
+}
+
+async fn list_blacklist(State(state): State<AppState>) -> Json<Vec<String>> {
+    Json(state.security.list_blocked_domains())
+}
+
+async fn add_blacklist(
+    State(state): State<AppState>,
+    Json(req): Json<AddBlacklistRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let domain = req.domain.trim().to_string();
+    if domain.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Domain cannot be empty" })));
+    }
+    state.security.add_blocked_domain(&domain);
+    (StatusCode::OK, Json(serde_json::json!({ "success": true, "domain": domain })))
+}
+
+async fn remove_blacklist(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let removed = state.security.remove_blocked_domain(&domain);
+    (StatusCode::OK, Json(serde_json::json!({ "success": removed, "domain": domain })))
 }

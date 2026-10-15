@@ -70,13 +70,13 @@ async fn test_pool_retry_on_first_node_failure() {
     // Connecting with retry should transparently succeed using good_node
     let res = pool.connect_with_retry(&target).await;
     assert!(res.is_ok(), "Expected retry to succeed on good node");
-    let (mut stream, _residual, node) = res.unwrap();
-    assert_eq!(node.id, 2);
+    let mut conn = res.unwrap();
+    assert_eq!(conn.node.id, 2);
 
     // Verify echo
-    stream.write_all(b"ping").await.unwrap();
+    conn.stream.write_all(b"ping").await.unwrap();
     let mut resp = [0u8; 4];
-    stream.read_exact(&mut resp).await.unwrap();
+    conn.stream.read_exact(&mut resp).await.unwrap();
     assert_eq!(&resp, b"ping");
 }
 
@@ -345,15 +345,18 @@ async fn test_sticky_session_and_same_ip_rotation() {
     let (_echo_l, echo_port) = run_mock_echo_server().await;
     let target = TargetAddr::from_ip("127.0.0.1".parse().unwrap(), echo_port);
 
-    // Node 1 & Node 2 both share the same egress IP: 104.20.1.1
+    // Verified public egress IP: 198.51.100.42
+    let shared_egress_ip: std::net::IpAddr = "198.51.100.42".parse().unwrap();
+
     let node1 = Arc::new(ProxyNode::new(
         1,
         "us-node-1",
         OutboundNodeConfig {
             dial_addrs: Arc::from(vec!["104.20.1.1:1080".parse().unwrap()].into_boxed_slice()),
-            protocol: OutboundProtocol::Direct, // for test echo, use Direct
+            protocol: OutboundProtocol::Direct,
         },
     ));
+    node1.set_probed_egress_ip(shared_egress_ip);
 
     let node2 = Arc::new(ProxyNode::new(
         2,
@@ -363,26 +366,29 @@ async fn test_sticky_session_and_same_ip_rotation() {
             protocol: OutboundProtocol::Direct,
         },
     ));
+    node2.set_probed_egress_ip(shared_egress_ip);
 
     let pool = ProxyPool::new(vec![node1.clone(), node2.clone()])
         .with_sticky_ttl(Duration::from_secs(60));
+    pool.leases().update_node_egress_ip(node1.id, None, Some(shared_egress_ip));
+    pool.leases().update_node_egress_ip(node2.id, None, Some(shared_egress_ip));
 
     // Request 1: first request from account "user_A" assigns a lease
-    let (_, _, picked1) = pool.connect_sticky("user_A", &target).await.unwrap();
-    let assigned_id = picked1.id;
+    let conn1 = pool.connect_sticky("user_A", &target).await.unwrap();
+    let assigned_id = conn1.node.id;
 
     // Request 2: subsequent request from "user_A" MUST route to the same node
-    let (_, _, picked2) = pool.connect_sticky("user_A", &target).await.unwrap();
-    assert_eq!(picked2.id, assigned_id, "Sticky session should route to same node");
+    let conn2 = pool.connect_sticky("user_A", &target).await.unwrap();
+    assert_eq!(conn2.node.id, assigned_id, "Sticky session should route to same node");
 
     // Simulate node failure: mark the assigned node cooling down
     let assigned_node = if assigned_id == 1 { &node1 } else { &node2 };
     assigned_node.mark_failure(1, Duration::from_secs(60)); // enters cooldown
 
-    // Request 3: assigned node is now cooling down -> MUST failover to candidate sharing the same Egress IP!
-    let (_, _, picked3) = pool.connect_sticky("user_A", &target).await.unwrap();
+    // Request 3: assigned node is now cooling down -> MUST failover to candidate sharing verified Egress IP!
+    let conn3 = pool.connect_sticky("user_A", &target).await.unwrap();
     let backup_id = if assigned_id == 1 { 2 } else { 1 };
-    assert_eq!(picked3.id, backup_id, "Should failover to backup node with same Egress IP");
+    assert_eq!(conn3.node.id, backup_id, "Should failover to backup node with same Egress IP");
 }
 
 #[test]
@@ -454,6 +460,7 @@ async fn test_admin_api_endpoints_and_rule_sandbox() {
     let state = proxy::api::AppState {
         pool,
         rules_runtime,
+        security: Arc::new(proxy::security::SecurityFilter::default()),
         admin_token: None,
         proxy_port: 1099,
     };
@@ -541,7 +548,47 @@ async fn test_admin_api_endpoints_and_rule_sandbox() {
     let missing_resp = client.get(format!("{base}/ui/missing-image.png")).send().await.unwrap();
     assert_eq!(missing_resp.status(), 404);
 
-    // 6. Prometheus /metrics Endpoint Test
+    // 6. Dynamic Rules API Test (list, upsert, delete)
+    let rules_list: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/rules"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rules_list.len(), 2);
+
+    // Upsert a new rule
+    let upsert_status = client
+        .put(format!("{base}/api/v1/rules/api.slack.com"))
+        .json(&serde_json::json!({ "headers": ["x-slack-team"] }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(upsert_status, 200);
+
+    let rules_after_upsert: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/rules"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rules_after_upsert.len(), 3);
+
+    // Delete the rule
+    let del_status = client
+        .delete(format!("{base}/api/v1/rules/api.slack.com"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(del_status, 200);
+
+    // 7. Prometheus /metrics Endpoint Test
     let metrics_resp = client.get(format!("{base}/metrics")).send().await.unwrap();
     assert_eq!(metrics_resp.status(), 200);
     let metrics_text = metrics_resp.text().await.unwrap();
@@ -666,6 +713,7 @@ async fn test_single_port_multiplexing_and_resin_reverse_proxy() {
     let api_state = proxy::api::AppState {
         pool: pool.clone(),
         rules_runtime: rules_runtime.clone(),
+        security: Arc::new(proxy::security::SecurityFilter::new(false)),
         admin_token: None,
         proxy_port: gateway_port,
     };
@@ -760,4 +808,189 @@ async fn test_single_port_multiplexing_and_resin_reverse_proxy() {
     let wrong_resp = client.get(&wrong_token_url).send().await;
     // Client should receive error or disconnected
     assert!(wrong_resp.is_err() || !wrong_resp.unwrap().status().is_success());
+}
+
+#[tokio::test]
+async fn test_security_ssrf_and_domain_blacklist() {
+    use proxy::{
+        outbound::{OutboundNodeConfig, OutboundProtocol},
+        pool::{ProxyNode, ProxyPool},
+        protocol::TargetAddr,
+        reverse::rules::AccountMatcherRuntime,
+        security::SecurityFilter,
+    };
+
+    let sec = SecurityFilter::new(true);
+
+    // 1. SSRF Private IP check
+    let private_target = TargetAddr::parse_authority("127.0.0.1:8080").unwrap();
+    assert!(sec.check_target(&private_target).is_err(), "Localhost IP must be blocked");
+
+    let cloud_meta = TargetAddr::parse_authority("169.254.169.254:80").unwrap();
+    assert!(sec.check_target(&cloud_meta).is_err(), "Cloud metadata must be blocked");
+
+    let internal_lan = TargetAddr::parse_authority("192.168.1.1:443").unwrap();
+    assert!(sec.check_target(&internal_lan).is_err(), "LAN IP must be blocked");
+
+    // Public IP allowed
+    let public_target = TargetAddr::parse_authority("1.1.1.1:443").unwrap();
+    assert!(sec.check_target(&public_target).is_ok());
+
+    // 2. Domain Blacklist
+    sec.add_blocked_domain("evil.com");
+    sec.add_blocked_domain("*.badsite.org");
+
+    let evil_target = TargetAddr::parse_authority("evil.com:443").unwrap();
+    assert!(sec.check_target(&evil_target).is_err(), "Direct domain match must be blocked");
+
+    let wildcard_target = TargetAddr::parse_authority("sub.badsite.org:443").unwrap();
+    assert!(sec.check_target(&wildcard_target).is_err(), "Wildcard suffix match must be blocked");
+
+    let safe_target = TargetAddr::parse_authority("github.com:443").unwrap();
+    assert!(sec.check_target(&safe_target).is_ok());
+
+    // 3. REST API control test: block & unblock node, blacklist management
+    let node = Arc::new(ProxyNode::new(
+        42,
+        "test-node",
+        OutboundNodeConfig {
+            dial_addrs: Arc::from(vec![].into_boxed_slice()),
+            protocol: OutboundProtocol::Direct,
+        },
+    ));
+    assert!(node.is_available());
+
+    let pool = Arc::new(ProxyPool::new(vec![node.clone()]));
+    let sec_filter = Arc::new(SecurityFilter::new(true));
+
+    let state = proxy::api::AppState {
+        pool: pool.clone(),
+        rules_runtime: Arc::new(AccountMatcherRuntime::new(&[])),
+        security: sec_filter.clone(),
+        admin_token: None,
+        proxy_port: 8080,
+    };
+
+    let router = proxy::api::create_api_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Test A: Block node 42
+    let res: serde_json::Value = client
+        .post(format!("{base}/api/v1/nodes/42/actions/block"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(res["status"], "blocked");
+    assert!(!node.is_available(), "Blocked node must not be available for routing");
+
+    // Test B: Unblock node 42
+    let res: serde_json::Value = client
+        .post(format!("{base}/api/v1/nodes/42/actions/unblock"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(res["status"], "healthy");
+    assert!(node.is_available(), "Unblocked node must be restored to available");
+
+    // Test C: Manage blacklist via REST API
+    let add_res: serde_json::Value = client
+        .post(format!("{base}/api/v1/security/blacklist"))
+        .json(&serde_json::json!({ "domain": "malicious.com" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add_res["domain"], "malicious.com");
+
+    let list_res: Vec<String> = client
+        .get(format!("{base}/api/v1/security/blacklist"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list_res.contains(&"malicious.com".to_string()));
+
+    let del_res: serde_json::Value = client
+        .delete(format!("{base}/api/v1/security/blacklist/malicious.com"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del_res["success"], true);
+}
+
+#[tokio::test]
+async fn test_admin_api_token_auth() {
+    let pool = Arc::new(ProxyPool::new(vec![]));
+    let rules_runtime = Arc::new(proxy::reverse::rules::AccountMatcherRuntime::new(&[]));
+    let security = Arc::new(proxy::security::SecurityFilter::default());
+
+    let state = proxy::api::AppState {
+        pool,
+        rules_runtime,
+        security,
+        admin_token: Some("superSecretAdminToken".into()),
+        proxy_port: 8080,
+    };
+
+    let router = proxy::api::create_api_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // 1. Without Token -> 401 Unauthorized
+    let resp = client.get(format!("{base}/api/v1/system/info")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 2. With Wrong Token -> 401 Unauthorized
+    let resp = client
+        .get(format!("{base}/api/v1/system/info"))
+        .header("Authorization", "Bearer wrongToken")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 3. With Valid Bearer Token -> 200 OK
+    let resp = client
+        .get(format!("{base}/api/v1/system/info"))
+        .header("Authorization", "Bearer superSecretAdminToken")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 4. With Valid Query Token (?token=...) -> 200 OK
+    let resp = client
+        .get(format!("{base}/api/v1/system/info?token=superSecretAdminToken"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }

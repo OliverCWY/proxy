@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::{Arc, RwLock}};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,7 @@ impl AccountMatcher {
 
 pub struct AccountMatcherRuntime {
     current: ArcSwap<AccountMatcher>,
+    rules: RwLock<Vec<AccountRule>>,
 }
 
 impl AccountMatcherRuntime {
@@ -103,6 +104,7 @@ impl AccountMatcherRuntime {
         let matcher = AccountMatcher::new(initial_rules);
         Self {
             current: ArcSwap::from_pointee(matcher),
+            rules: RwLock::new(initial_rules.to_vec()),
         }
     }
 
@@ -110,8 +112,41 @@ impl AccountMatcherRuntime {
         self.current.load()
     }
 
+    pub fn get_rules(&self) -> Vec<AccountRule> {
+        self.rules.read().unwrap().clone()
+    }
+
+    /// Incremental upsert of a rule without wiping existing rules
+    pub fn upsert_rule(&self, rule: AccountRule) {
+        let mut list = self.rules.write().unwrap();
+        let norm_prefix = normalize_rule_prefix(&rule.url_prefix);
+        if let Some(pos) = list.iter().position(|r| normalize_rule_prefix(&r.url_prefix) == norm_prefix) {
+            list[pos] = rule;
+        } else {
+            list.push(rule);
+        }
+        let new_matcher = AccountMatcher::new(&list);
+        self.current.store(Arc::new(new_matcher));
+    }
+
+    /// Delete a rule by its prefix
+    pub fn delete_rule(&self, prefix: &str) -> bool {
+        let mut list = self.rules.write().unwrap();
+        let norm_prefix = normalize_rule_prefix(prefix);
+        let orig_len = list.len();
+        list.retain(|r| normalize_rule_prefix(&r.url_prefix) != norm_prefix);
+        let deleted = list.len() < orig_len;
+        if deleted {
+            let new_matcher = AccountMatcher::new(&list);
+            self.current.store(Arc::new(new_matcher));
+        }
+        deleted
+    }
+
     /// Atomic hot-swap of entire rule tree without downtime or locks
     pub fn replace_rules(&self, new_rules: &[AccountRule]) {
+        let mut list = self.rules.write().unwrap();
+        *list = new_rules.to_vec();
         let new_matcher = AccountMatcher::new(new_rules);
         self.current.store(Arc::new(new_matcher));
     }

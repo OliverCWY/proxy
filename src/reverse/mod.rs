@@ -8,13 +8,14 @@ use crate::{
     error::InboundError,
     inbound::http::ReverseHttpRequest,
     pool::ProxyPool,
-    protocol::Credentials,
+    protocol::{Credentials, TargetHost},
     reverse::{rules::AccountMatcherRuntime, v1::parse_resin_path},
 };
 
 pub struct ReverseProxyHandler {
     pool: Arc<ProxyPool>,
     rules_runtime: Option<Arc<AccountMatcherRuntime>>,
+    security: Option<Arc<crate::security::SecurityFilter>>,
     proxy_token: Option<String>,
     auth: Option<Credentials>,
 }
@@ -29,9 +30,15 @@ impl ReverseProxyHandler {
         Self {
             pool,
             rules_runtime,
+            security: None,
             proxy_token,
             auth,
         }
+    }
+
+    pub fn with_security(mut self, security: Arc<crate::security::SecurityFilter>) -> Self {
+        self.security = Some(security);
+        self
     }
 
     pub fn auth(&self) -> Option<&Credentials> {
@@ -70,8 +77,38 @@ impl ReverseProxyHandler {
         let target = parsed_target.target;
         let target_path = parsed_target.target_path;
 
+        // Fast Security Check (SSRF & Domain Blacklist)
+        if let Some(sec) = &self.security {
+            if let Err(reason) = sec.check_target(&target) {
+                return Err(InboundError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    reason,
+                )));
+            }
+        }
+
+        // Resolve account: first from URL segment, fallback to Trie rules & headers
+        let effective_account = if let Some(acc) = parsed_target.account {
+            Some(acc)
+        } else if let Some(rules) = &self.rules_runtime {
+            let host_str = match &target.host {
+                TargetHost::Domain(d) => d.to_string(),
+                TargetHost::Ip(ip) => ip.to_string(),
+            };
+            rules.load().resolve_account(&host_str, &target_path, |name| {
+                for h in req.headers.iter() {
+                    if h.name.eq_ignore_ascii_case(name) {
+                        return std::str::from_utf8(h.value).ok();
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+
         // Forward to target through proxy pool (using sticky session if account is present!)
-        let (mut upstream, _upstream_residual, _node) = if let Some(account) = parsed_target.account {
+        let mut conn = if let Some(account) = effective_account {
             self.pool.connect_sticky(&account, &target).await.map_err(|e| {
                 InboundError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
@@ -110,21 +147,22 @@ impl ReverseProxyHandler {
         }
         fwd_headers.extend_from_slice(b"\r\n");
 
-        upstream.write_all(&fwd_headers).await?;
+        conn.stream.write_all(&fwd_headers).await?;
 
         // Forward any body that was read
         if !req_session.body_residual.is_empty() {
-            upstream.write_all(&req_session.body_residual).await?;
+            conn.stream.write_all(&req_session.body_residual).await?;
         }
 
         // Forward residual buffer in stream
         let unconsumed = req_session.stream.buffer();
         if !unconsumed.is_empty() {
-            upstream.write_all(unconsumed).await?;
+            conn.stream.write_all(unconsumed).await?;
         }
 
         let mut client_socket = req_session.stream.into_inner();
-        let _ = tokio::io::copy_bidirectional(&mut client_socket, &mut upstream).await;
+        let relay_res = tokio::io::copy_bidirectional(&mut client_socket, &mut conn.stream).await;
+        conn.record_relay_result(&relay_res, 3, std::time::Duration::from_secs(10));
 
         Ok(())
     }

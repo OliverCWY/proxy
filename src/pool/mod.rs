@@ -18,11 +18,64 @@ use crate::{
 };
 
 pub use lease::{Lease, LeaseTable};
-pub use node::{NodeHealthStatus, ProxyNode};
+pub use node::{ConnectionPermit, NodeHealthStatus, ProxyNode};
 pub use selector::{PowerOfTwoChoices, Random, RoundRobin, Selector};
 
 pub struct PoolSnapshot {
     pub nodes: Arc<[Arc<ProxyNode>]>,
+    pub nodes_by_id: std::collections::HashMap<usize, Arc<ProxyNode>>,
+}
+
+impl PoolSnapshot {
+    pub fn new(nodes: Vec<Arc<ProxyNode>>) -> Self {
+        let mut map = std::collections::HashMap::with_capacity(nodes.len());
+        for n in &nodes {
+            map.insert(n.id, n.clone());
+        }
+        Self {
+            nodes: nodes.into(),
+            nodes_by_id: map,
+        }
+    }
+}
+
+pub struct ConnectedProxy {
+    pub stream: TcpStream,
+    pub residual: bytes::Bytes,
+    pub node: Arc<ProxyNode>,
+    pub permit: ConnectionPermit,
+}
+
+impl ConnectedProxy {
+    pub fn new(stream: TcpStream, residual: bytes::Bytes, node: Arc<ProxyNode>) -> Self {
+        let permit = ConnectionPermit::new(node.clone());
+        Self {
+            stream,
+            residual,
+            node,
+            permit,
+        }
+    }
+
+    /// Record relay error result to passive circuit breaker
+    pub fn record_relay_result(
+        &self,
+        res: &std::io::Result<(u64, u64)>,
+        max_failures: usize,
+        base_cooldown: Duration,
+    ) {
+        if let Err(e) = res {
+            match e.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut => {
+                    self.node.mark_failure(max_failures, base_cooldown);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 pub struct ProxyPool {
@@ -39,9 +92,7 @@ pub struct ProxyPool {
 impl ProxyPool {
     pub fn new(nodes: Vec<Arc<ProxyNode>>) -> Self {
         let pool = Self {
-            snapshot: ArcSwap::from_pointee(PoolSnapshot {
-                nodes: nodes.clone().into(),
-            }),
+            snapshot: ArcSwap::from_pointee(PoolSnapshot::new(nodes)),
             selector: Box::new(PowerOfTwoChoices),
             leases: Arc::new(LeaseTable::new(Duration::from_secs(1800))), // 30 mins default TTL
             max_retries: 3,
@@ -54,13 +105,6 @@ impl ProxyPool {
                 .build()
                 .unwrap_or_default(),
         };
-
-        // Populate initial egress IP index for nodes that have dial_addrs
-        for node in &nodes {
-            if let Some(first_addr) = node.config.dial_addrs.first() {
-                pool.leases.update_node_egress_ip(node.id, None, Some(first_addr.ip()));
-            }
-        }
 
         pool
     }
@@ -88,10 +132,28 @@ impl ProxyPool {
     }
 
     /// Atomically replace the proxy pool with a new snapshot of nodes (Zero downtime hot reload)
+    /// Preserves existing runtime state (stats, EWMA, cooldown, verified egress IP)
     pub fn reload_nodes(&self, new_nodes: Vec<Arc<ProxyNode>>) {
-        let new_snapshot = Arc::new(PoolSnapshot {
-            nodes: new_nodes.into(),
-        });
+        let current = self.snapshot.load();
+        let mut merged = Vec::with_capacity(new_nodes.len());
+
+        for new_node in new_nodes {
+            if let Some(existing) = current
+                .nodes
+                .iter()
+                .find(|n| n.tag == new_node.tag || n.id == new_node.id)
+            {
+                // Preserve runtime identity and stats
+                if new_node.is_blocked.load(Ordering::Relaxed) {
+                    existing.block();
+                }
+                merged.push(existing.clone());
+            } else {
+                merged.push(new_node);
+            }
+        }
+
+        let new_snapshot = Arc::new(PoolSnapshot::new(merged));
         self.snapshot.store(new_snapshot);
     }
 
@@ -100,39 +162,42 @@ impl ProxyPool {
         self.snapshot.load().nodes.len()
     }
 
-    /// Find node by ID
+    /// Get atomic snapshot of all nodes in pool
+    pub fn all_nodes(&self) -> Arc<[Arc<ProxyNode>]> {
+        self.snapshot.load().nodes.clone()
+    }
+
+    /// Find node by ID in O(1) lock-free time
     pub fn find_node(&self, id: usize) -> Option<Arc<ProxyNode>> {
         let snapshot = self.snapshot.load();
-        snapshot.nodes.iter().find(|n| n.id == id).cloned()
+        snapshot.nodes_by_id.get(&id).cloned()
     }
 
     /// Connect to target with sticky session support.
     /// 1. If valid lease exists and node is healthy -> use bound node.
-    /// 2. If bound node fails/unhealthy -> O(1) failover to candidate sharing same Egress IP!
+    /// 2. If bound node fails/unhealthy -> O(1) failover to candidate sharing same verified Egress IP!
     /// 3. If no same-IP node available -> select new node via P2C and update lease.
     pub async fn connect_sticky(
         &self,
         account: &str,
         target: &TargetAddr,
-    ) -> Result<(TcpStream, bytes::Bytes, Arc<ProxyNode>), PoolError> {
+    ) -> Result<ConnectedProxy, PoolError> {
         // Step 1: Check existing lease
         if let Some(lease) = self.leases.get_lease(account) {
             if let Some(node) = self.find_node(lease.node_id) {
-                if node.is_available() {
-                    node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                if node.try_admit() {
                     let start = std::time::Instant::now();
                     let res = OutboundConnector::connect(&node.config, target, self.connect_timeout).await;
-                    node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
 
                     if let Ok((stream, residual)) = res {
                         node.mark_success_with_rtt(start.elapsed());
-                        return Ok((stream, residual, node));
+                        return Ok(ConnectedProxy::new(stream, residual, node));
                     }
                     node.mark_failure(self.max_consecutive_failures, self.base_cooldown);
                 }
             }
 
-            // Step 2: Bound node failed, try same-IP failover candidates in O(1)
+            // Step 2: Bound node failed, try verified same-IP failover candidates in O(1)
             if let Some(egress_ip) = lease.egress_ip {
                 let candidates = self.leases.get_same_ip_candidates(egress_ip);
                 for cand_id in candidates {
@@ -140,16 +205,14 @@ impl ProxyPool {
                         continue;
                     }
                     if let Some(node) = self.find_node(cand_id) {
-                        if node.is_available() {
-                            node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                        if node.try_admit() {
                             let start = std::time::Instant::now();
                             let res = OutboundConnector::connect(&node.config, target, self.connect_timeout).await;
-                            node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
 
                             if let Ok((stream, residual)) = res {
                                 node.mark_success_with_rtt(start.elapsed());
                                 self.leases.rotate_lease_node(account, cand_id);
-                                return Ok((stream, residual, node));
+                                return Ok(ConnectedProxy::new(stream, residual, node));
                             }
                             node.mark_failure(self.max_consecutive_failures, self.base_cooldown);
                         }
@@ -159,68 +222,72 @@ impl ProxyPool {
         }
 
         // Step 3: Fallback - pick new node with retry and record lease
-        let (stream, residual, node) = self.connect_with_retry(target).await?;
-        let egress_ip = node.config.dial_addrs.first().map(|a| a.ip());
-        self.leases.create_lease(account, node.id, egress_ip);
+        let conn = self.connect_with_retry(target).await?;
+        let verified_egress_ip = conn.node.probed_egress_ip();
+        self.leases.create_lease(account, conn.node.id, verified_egress_ip);
 
-        Ok((stream, residual, node))
+        Ok(conn)
     }
 
     /// Connect to target with automatic retry over candidate proxy nodes.
-    /// Returns the connected TCP stream, residual bytes, and the chosen ProxyNode.
+    /// Returns ConnectedProxy containing the connected TCP stream, residual bytes, ProxyNode, and RAII ConnectionPermit.
     pub async fn connect_with_retry(
         &self,
         target: &TargetAddr,
-    ) -> Result<(TcpStream, bytes::Bytes, Arc<ProxyNode>), PoolError> {
+    ) -> Result<ConnectedProxy, PoolError> {
         let snapshot = self.snapshot.load();
         let total_nodes = snapshot.nodes.len();
         if total_nodes == 0 {
             return Err(PoolError::NoHealthyProxy);
         }
 
-        // Filter available nodes (Healthy or HalfOpen)
-        let eligible: Vec<Arc<ProxyNode>> = snapshot
-            .nodes
-            .iter()
-            .filter(|n| n.is_available())
-            .cloned()
-            .collect();
-
-        let candidate_pool = if eligible.is_empty() {
-            // Degraded mode: all nodes are cooling down, try all nodes
-            &snapshot.nodes[..]
-        } else {
-            &eligible[..]
-        };
-
-        let attempts = self.max_retries.min(candidate_pool.len()).max(1);
+        let attempts = self.max_retries.min(total_nodes).max(1);
         let mut tried_node_ids = HashSet::with_capacity(attempts);
         let mut errors = Vec::new();
 
         for _ in 0..attempts {
-            // Pick a candidate not yet tried
-            let remaining: Vec<Arc<ProxyNode>> = candidate_pool
-                .iter()
-                .filter(|n| !tried_node_ids.contains(&n.id))
-                .cloned()
-                .collect();
+            // Find an admitted node not yet tried
+            let candidate = {
+                let untried: Vec<&Arc<ProxyNode>> = snapshot
+                    .nodes
+                    .iter()
+                    .filter(|n| !tried_node_ids.contains(&n.id))
+                    .collect();
 
-            let node = match self.selector.select(&remaining) {
-                Some(n) => n.clone(),
+                if untried.is_empty() {
+                    break;
+                }
+
+                // Prefer nodes that pass try_admit()
+                let admitted: Vec<Arc<ProxyNode>> = untried
+                    .iter()
+                    .filter(|n| n.try_admit())
+                    .map(|n| (*n).clone())
+                    .collect();
+
+                if !admitted.is_empty() {
+                    self.selector.select(&admitted).cloned()
+                } else {
+                    // Degraded mode: all nodes are cooling down, select best among untried
+                    let pool: Vec<Arc<ProxyNode>> = untried.into_iter().cloned().collect();
+                    self.selector.select(&pool).cloned()
+                }
+            };
+
+            let node = match candidate {
+                Some(n) => n,
                 None => break,
             };
 
             tried_node_ids.insert(node.id);
-            node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
             let start = std::time::Instant::now();
             let res = OutboundConnector::connect(&node.config, target, self.connect_timeout).await;
-            node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
 
             match res {
                 Ok((stream, residual)) => {
                     node.mark_success_with_rtt(start.elapsed());
-                    return Ok((stream, residual, node));
+                    return Ok(ConnectedProxy::new(stream, residual, node));
                 }
                 Err(err) => {
                     let is_retryable = err.is_retryable();

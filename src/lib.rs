@@ -6,6 +6,7 @@ pub mod outbound;
 pub mod pool;
 pub mod protocol;
 pub mod reverse;
+pub mod security;
 pub mod subscription;
 
 // Compatibility modules for existing tests and utilities

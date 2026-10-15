@@ -54,6 +54,9 @@ pub enum OutboundErrorKind {
     #[error("Protocol error while talking to upstream: {0}")]
     UpstreamProtocolError(String),
 
+    #[error("Destination target blocked by security rule: {0}")]
+    TargetBlocked(String),
+
     #[error("Connection timed out")]
     Timeout,
 
@@ -86,6 +89,7 @@ impl OutboundError {
                 // 0x01 general failure, 0x03 net unreachable, 0x04 host unreachable, 0x05 conn refused, 0x06 TTL expired
                 matches!(*rep, 0x01 | 0x03 | 0x04 | 0x05 | 0x06)
             }
+            OutboundErrorKind::TargetBlocked(_) => false,
             OutboundErrorKind::DnsResolutionFailed(_) => false,
             OutboundErrorKind::UpstreamAuthFailed => false, // bad credentials won't fix with retry
             OutboundErrorKind::UpstreamProtocolError(_) => true,

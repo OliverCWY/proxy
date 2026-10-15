@@ -191,13 +191,21 @@ async fn main() -> anyhow::Result<()> {
         }
     ]));
 
-    let forward_handler = Arc::new(ForwardHandler::new(pool.clone(), inbound_auth.clone()));
-    let reverse_handler = Arc::new(ReverseProxyHandler::new(
-        pool.clone(),
-        Some(rules_runtime.clone()),
-        proxy_token.clone(),
-        inbound_auth,
-    ));
+    let security_filter = Arc::new(proxy::security::SecurityFilter::new(true));
+
+    let forward_handler = Arc::new(
+        ForwardHandler::new(pool.clone(), inbound_auth.clone())
+            .with_security(security_filter.clone()),
+    );
+    let reverse_handler = Arc::new(
+        ReverseProxyHandler::new(
+            pool.clone(),
+            Some(rules_runtime.clone()),
+            proxy_token.clone(),
+            inbound_auth,
+        )
+        .with_security(security_filter.clone()),
+    );
 
     let admin_port = std::env::var("ADMIN_PORT")
         .or_else(|_| std::env::var("admin_port"))
@@ -207,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
     let api_state = proxy::api::AppState {
         pool: pool.clone(),
         rules_runtime: rules_runtime.clone(),
+        security: security_filter.clone(),
         admin_token,
         proxy_port: port,
     };

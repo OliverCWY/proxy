@@ -1,8 +1,10 @@
 use std::{
+    net::IpAddr,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::outbound::OutboundNodeConfig;
@@ -12,6 +14,7 @@ pub enum NodeHealthStatus {
     Healthy,
     Cooldown,
     HalfOpen,
+    Blocked,
 }
 
 #[derive(Debug)]
@@ -76,7 +79,36 @@ pub struct ProxyNode {
     pub tag: String,
     pub config: OutboundNodeConfig,
     pub stats: NodeStats,
-    cooldown_until: std::sync::Mutex<Option<Instant>>,
+    pub is_blocked: AtomicBool,
+    /// Unix timestamp millis until which node is cooling down (0 = healthy)
+    cooldown_until_ms: AtomicU64,
+    /// Concurrency token for half-open probe admission (only 1 probe at a time)
+    half_open_probe_active: AtomicBool,
+    /// Verified public egress IP detected via external probe
+    probed_egress_ip: RwLock<Option<IpAddr>>,
+}
+
+/// RAII Permit that tracks active connection lifetime accurately
+#[derive(Debug)]
+pub struct ConnectionPermit {
+    node: Arc<ProxyNode>,
+}
+
+impl ConnectionPermit {
+    pub fn new(node: Arc<ProxyNode>) -> Self {
+        node.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { node }
+    }
+
+    pub fn node(&self) -> &Arc<ProxyNode> {
+        &self.node
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.node.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ProxyNode {
@@ -86,20 +118,69 @@ impl ProxyNode {
             tag: tag.into(),
             config,
             stats: NodeStats::default(),
-            cooldown_until: std::sync::Mutex::new(None),
+            is_blocked: AtomicBool::new(false),
+            cooldown_until_ms: AtomicU64::new(0),
+            half_open_probe_active: AtomicBool::new(false),
+            probed_egress_ip: RwLock::new(None),
         }
     }
 
+    pub fn block(&self) {
+        self.is_blocked.store(true, Ordering::Relaxed);
+    }
+
+    pub fn unblock(&self) {
+        self.is_blocked.store(false, Ordering::Relaxed);
+    }
+
+    pub fn probed_egress_ip(&self) -> Option<IpAddr> {
+        *self.probed_egress_ip.read().unwrap()
+    }
+
+    pub fn set_probed_egress_ip(&self, ip: IpAddr) {
+        *self.probed_egress_ip.write().unwrap() = Some(ip);
+    }
+
     pub fn status(&self) -> NodeHealthStatus {
-        let lock = self.cooldown_until.lock().unwrap();
-        if let Some(until) = *lock {
-            if Instant::now() < until {
+        if self.is_blocked.load(Ordering::Relaxed) {
+            return NodeHealthStatus::Blocked;
+        }
+
+        let until = self.cooldown_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            NodeHealthStatus::Healthy
+        } else {
+            let now_ms = now_unix_ms();
+            if now_ms < until {
                 NodeHealthStatus::Cooldown
             } else {
                 NodeHealthStatus::HalfOpen
             }
+        }
+    }
+
+    /// High performance, lock-free admission control with true HalfOpen single-probe throttling
+    pub fn try_admit(&self) -> bool {
+        if self.is_blocked.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let until = self.cooldown_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            // Healthy node: always admitted
+            true
         } else {
-            NodeHealthStatus::Healthy
+            let now_ms = now_unix_ms();
+            if now_ms < until {
+                // Still in cooldown
+                false
+            } else {
+                // Cooldown expired -> HalfOpen state!
+                // Atomically allow exactly ONE probe request through.
+                self.half_open_probe_active
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            }
         }
     }
 
@@ -108,8 +189,9 @@ impl ProxyNode {
         self.stats.successful_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.consecutive_failures.store(0, Ordering::Relaxed);
 
-        let mut lock = self.cooldown_until.lock().unwrap();
-        *lock = None;
+        // Reset cooldown and half-open probe lock-free
+        self.cooldown_until_ms.store(0, Ordering::Relaxed);
+        self.half_open_probe_active.store(false, Ordering::Relaxed);
     }
 
     pub fn mark_success_with_rtt(&self, rtt: Duration) {
@@ -135,16 +217,25 @@ impl ProxyNode {
             let exponent = (failures - max_consecutive_failures).min(6) as u32;
             let cooldown = base_cooldown.saturating_mul(1 << exponent).min(Duration::from_secs(300));
 
-            let mut lock = self.cooldown_until.lock().unwrap();
-            *lock = Some(Instant::now() + cooldown);
+            let deadline_ms = now_unix_ms() + cooldown.as_millis() as u64;
+            self.cooldown_until_ms.store(deadline_ms, Ordering::Relaxed);
         }
+
+        // Release half-open probe active lock so subsequent retries/probes can try after cooldown
+        self.half_open_probe_active.store(false, Ordering::Relaxed);
     }
 
     pub fn is_available(&self) -> bool {
         match self.status() {
-            NodeHealthStatus::Healthy => true,
-            NodeHealthStatus::HalfOpen => true,
-            NodeHealthStatus::Cooldown => false,
+            NodeHealthStatus::Healthy | NodeHealthStatus::HalfOpen => true,
+            NodeHealthStatus::Cooldown | NodeHealthStatus::Blocked => false,
         }
     }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

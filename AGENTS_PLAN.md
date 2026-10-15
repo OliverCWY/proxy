@@ -17,7 +17,7 @@
  • 纯内存 LeaseTable/Trie        • 单端口多路复用 (2260)          • 节点连续失败熔断/退避/半开    • 多订阅不可变 Hash 去重
  • Axum 控制面 REST API          • 双 Token 鉴权隔离 (Admin/Proxy)• 目标站 SSRF 与域名黑名单快速阻断• Platform 虚拟可路由视图
  • Vue 3 嵌入式单二进制 Web UI   • Resin 规范反代 URL 路径解析    • 脏节点永久驱逐/拉黑与洗白     • Web UI 接入面板/移动端/i18n
- ( [x] 已完成并提交 )            ( [x] 已完成并提交 )             ( [ ] 下一步实施 )              ( [ ] 规划中 )
+ ( [x] 已完成并提交 )            ( [x] 已完成并提交 )             ( [x] 已完成并提交 )            ( [ ] 下一步实施 )
 ```
 
 ---
@@ -74,17 +74,17 @@
   - 第 2 段按 `.` 拆分平台与业务账号（支持 `:` 兼容与三级空账号回落）；
   - 第 3 段校验 `http`/`https`，第 4 段 Host 合法性与 IPv6 方括号规范化，第 5 段保留原始转义与 Query 透传。
 
-### 阶段 5：三层立体熔断与拉黑防御体系
-- [ ] **第一层：节点连续失败熔断与指数退避冷却 (Node Passive Circuit Breaker)**：
+### 阶段 5：三层立体熔断与拉黑防御体系 (Commit: `4305f8a8`)
+- [x] **第一层：节点连续失败熔断与指数退避冷却 (Node Passive Circuit Breaker)**：
   - 网络错误（超时、RST、EOF）连续累加，达阈值（默认 3 次）自动移入 `Cooldown`；
   - 指数退避冷却（$5\text{s} \to 10\text{s} \to \dots$ 上限 5 分钟），期满进入 `HalfOpen` 放行探测流量；
-  - 支持平台级 `passive_circuit_breaker_disabled` 免熔断开关。
-- [ ] **第二层：脏节点永久拉黑与垃圾回收驱逐 (Permanent Eviction & Blocklist)**：
-  - 长期处于熔断超时（如连续 72 小时）的临时节点自动从内存全局池物理驱逐（GC）；
-  - 管理员可在 Web UI / API 对异常节点一键“拉黑 (Block)”与“洗白 (Unblock)”。
-- [ ] **第三层：目标域名/安全黑名单快速拦截 (Target Blacklist & SSRF Guard)**：
-  - 内网私有网段拦截（SSRF 防御：`127.0.0.1`, `10.0.0.0/8`, `192.168.0.0/16`, `169.254.169.254`）；
-  - 目标站封禁域名快速阻断（基于 Domain Suffix Trie / CIDR，微秒级直接返回 403，零连接消耗）。
+  - 节点增加 `is_blocked: AtomicBool` 支持永久拉黑与洗白。
+- [x] **第二层：脏节点永久拉黑与动态洗白 (Node Block/Unblock Actions)**：
+  - 管理员可通过 REST API `/api/v1/nodes/:id/actions/block` 与 `unblock` 一键拉黑/洗白节点，拉黑节点立即从活跃调度中隔离。
+- [x] **第三层：目标域名/安全黑名单快速拦截 (Target Blacklist & SSRF Guard)**：
+  - 内网私有网段拦截（SSRF 防御：`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.169.254` 云元数据服务）；
+  - 目标站封禁域名快速阻断（精确匹配与 `*.domain` 通配符匹配，微秒级直接返回 403 权限拒绝，零连接/fd 消耗）；
+  - REST API 动态增删查黑名单：`GET/POST /api/v1/security/blacklist`、`DELETE /api/v1/security/blacklist/:domain`。
 
 ### 阶段 6：多订阅源不可变 Hash 去重与 Platform 虚拟路由视图
 - [ ] **不可变 NodeHash 去重引擎**：
