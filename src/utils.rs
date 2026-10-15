@@ -56,7 +56,8 @@ pub fn parse_proxy(proxy: &str) -> Option<SimpleProxy> {
         Some(sep) => (Some(&main[..sep]), &main[sep + 1..]),
         None => (None, main),
     };
-    let endpoint = Endpoint::try_parse(unsafe { str::from_utf8_unchecked(endpoint_str) }, proto)?;
+    let endpoint_str_clean = std::str::from_utf8(endpoint_str).ok()?;
+    let endpoint = Endpoint::try_parse(endpoint_str_clean, proto)?;
     match proto {
         Proto::Http => Some(SimpleProxy::Http {
             auth_header: auth.map_or_default(generate_http_auth),

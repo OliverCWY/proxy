@@ -202,7 +202,7 @@ impl Socks5ReadyState {
             .await?;
         Ok(self.stream)
     }
-    pub(super) async fn fail(mut self, error: OutboundError) -> InboundResult<()> {
+    pub(super) async fn fail(mut self, _error: OutboundError) -> InboundResult<()> {
         self.stream
             .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await?;

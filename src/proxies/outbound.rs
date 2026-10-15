@@ -1,4 +1,4 @@
-use std::{ptr::addr_eq, sync::Arc};
+use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use async_trait::async_trait;

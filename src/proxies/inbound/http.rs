@@ -157,7 +157,7 @@ impl HttpReadyState {
             .await?;
         Ok(self.stream)
     }
-    pub async fn fail(mut self, error: OutboundError) -> InboundResult<()> {
+    pub async fn fail(mut self, _error: OutboundError) -> InboundResult<()> {
         self.stream.write_all(b"502 Bad Gateway").await?;
         Ok(())
     }

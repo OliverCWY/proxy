@@ -1,0 +1,66 @@
+name: Daily Build & Release
+
+on:
+  schedule:
+    # UTC 18:17 = UTC+8 (Beijing/Shanghai) 02:17 every day
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Gateway Binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run test suite
+        run: cargo test --verbose
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary archive
+        id: package
+        run: |
+          TAG_DATE=$(date -u +"%Y%m%d-%H%M")
+          RELEASE_TAG="nightly-${TAG_DATE}"
+          ARCHIVE_NAME="proxy-linux-x86_64-${RELEASE_TAG}.tar.gz"
+
+          tar -czvf "${ARCHIVE_NAME}" -C target/release proxy
+          echo "tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          echo "archive=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: "Release ${{ steps.package.outputs.tag }}"
+          body: |
+            Automated daily release built at UTC+8 02:17.
+            Includes high-performance protocol sniffing forward & reverse proxy gateway.
+          files: ${{ steps.package.outputs.archive }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
