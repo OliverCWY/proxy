@@ -526,4 +526,18 @@ async fn test_admin_api_endpoints_and_rule_sandbox() {
         .await
         .unwrap();
     assert_eq!(res["extracted_account"], "Bearer token123");
+
+    // 5. Embedded Web UI & SPA Fallback Tests
+    let ui_resp = client.get(format!("{base}/ui/")).send().await.unwrap();
+    assert_eq!(ui_resp.status(), 200);
+    let ui_html = ui_resp.text().await.unwrap();
+    assert!(ui_html.contains("html"), "Should return embedded index.html");
+
+    // SPA History Route fallback: /ui/nodes has no extension -> should return index.html
+    let spa_resp = client.get(format!("{base}/ui/nodes")).send().await.unwrap();
+    assert_eq!(spa_resp.status(), 200);
+
+    // Missing file with extension -> should return 404
+    let missing_resp = client.get(format!("{base}/ui/missing-image.png")).send().await.unwrap();
+    assert_eq!(missing_resp.status(), 404);
 }

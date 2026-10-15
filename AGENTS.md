@@ -22,4 +22,4 @@
 
 ## 4. Experiences Reference
 - 深度网络协议踩坑与架构经验：[`./EXPERIENCES/PROTOCOL_GATEWAY.md`](./EXPERIENCES/PROTOCOL_GATEWAY.md)
-- 追踪与待办计划：[`./AGENTS_TODO.md`](./AGENTS_TODO.md)
+- 架构规划与任务追踪：[`./AGENTS_PLAN.md`](./AGENTS_PLAN.md)

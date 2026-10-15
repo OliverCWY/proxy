@@ -1,3 +1,5 @@
+pub mod webui;
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::{
     Json, Router,
@@ -25,6 +27,10 @@ pub struct AppState {
 
 pub fn create_api_router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(webui::root_redirect))
+        .route("/ui", get(webui::ui_root_redirect))
+        .route("/ui/", get(webui::static_handler))
+        .route("/ui/{*path}", get(webui::static_handler))
         .route("/api/v1/system/info", get(get_system_info))
         .route("/api/v1/nodes", get(list_nodes))
         .route("/api/v1/nodes/{id}/actions/probe", post(probe_node))

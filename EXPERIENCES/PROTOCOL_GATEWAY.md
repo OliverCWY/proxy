@@ -35,3 +35,14 @@
   2. Downstream target hosts (`TargetAddr`) maintain `TargetHost::Domain` intact so that SOCKS5h can forward the domain name directly to the remote exit node.
 - **Scope**: Multi-hop proxy pools and protocol converters.
 - **Verification**: `tests/outbound.rs` and `test_socks5_delayed_commit_and_auth`.
+
+---
+
+### Pitfall 5: Obscura Browser Automation Local SSRF Guard Blocks Loopback Addresses
+- **Symptom**: Calling `browser_navigate` to `http://127.0.0.1:...` or `http://localhost:...` during E2E UI testing fails with `Network error: Access to private/internal IP address 127.0.0.1 is not allowed`.
+- **Cause**: Obscura MCP server enforces SSRF protection by default, blocking navigation to RFC 1918 private subnets and 127.0.0.1 loopback addresses.
+- **Fix**:
+  1. For headless UI testing of local embedded services, start Obscura with `OBSCURA_ALLOW_PRIVATE_NETWORK=1` or `--allow-private-network`;
+  2. In automated Rust integration tests, verify embedded single-binary asset responses, MIME types, and SPA History Fallback directly via HTTP clients (`reqwest`).
+- **Scope**: All local frontend/UI automation and browser testing against dev servers.
+- **Verification**: Integration test `test_admin_api_endpoints_and_rule_sandbox` step 5 verifying `GET /ui/`, `/ui/nodes`, and 404 behavior.
